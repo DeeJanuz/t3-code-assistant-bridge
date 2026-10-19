@@ -145,9 +145,14 @@ function baseThread(thread: Json): Omit<T3ThreadShell, "latestTurn" | "session">
   };
 }
 
-/** Background work from the V2 shell roster: subagents and commands are work; only monitors are monitoring. */
+/**
+ * Background work from the V2 shell roster: subagents and opaque tasks are work; only monitors are monitoring.
+ * Background shell commands (Claude `run_in_background`, Codex background commands) can outlive the session
+ * indefinitely, so T3 itself does not count them as live work. Neither does the bridge.
+ */
 function backgroundFromTasks(tasks: readonly unknown[]): "working" | "monitoring" | undefined {
-  const kinds = tasks.flatMap((task) => record(task) ? [String(task.kind ?? "background_task")] : []);
+  const kinds = tasks.flatMap((task) => record(task) ? [String(task.kind ?? "background_task")] : [])
+    .filter((kind) => kind !== "command");
   if (kinds.length === 0) return undefined;
   return kinds.every((kind) => kind === "monitor") ? "monitoring" : "working";
 }

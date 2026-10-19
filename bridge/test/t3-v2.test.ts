@@ -76,7 +76,11 @@ describe("T3 V2 shell adapter", () => {
         pendingRuntimeRequest: { id: "request-1", kind: "user_input", createdAt: "2026-10-13T10:01:05.000Z" } }),
       shellThread({ id: "done", latestRunId: RUN_1, status: "completed", latestRunRequestedAt: "2026-10-13T10:01:00.000Z",
         latestRunStartedAt: "2026-10-13T10:01:01.000Z", latestRunCompletedAt: "2026-10-13T10:01:30.000Z",
-        pendingBackgroundTasks: [{ taskId: "watch", kind: "monitor" }] }),
+        pendingBackgroundTasks: [{ taskId: "watch", kind: "monitor" }, { taskId: "server", kind: "command" }] }),
+      shellThread({ id: "shell-only", latestRunId: RUN_1, status: "completed", latestRunRequestedAt: "2026-10-13T10:01:00.000Z",
+        latestRunCompletedAt: "2026-10-13T10:01:30.000Z", pendingBackgroundTasks: [{ taskId: "server", kind: "command" }] }),
+      shellThread({ id: "opaque", latestRunId: RUN_1, status: "completed", latestRunRequestedAt: "2026-10-13T10:01:00.000Z",
+        latestRunCompletedAt: "2026-10-13T10:01:30.000Z", pendingBackgroundTasks: [{ taskId: "t", kind: "background_task" }] }),
       shellThread({ id: "failed", latestRunId: RUN_1, status: "failed", latestRunRequestedAt: "2026-10-13T10:01:00.000Z",
         latestRunCompletedAt: "2026-10-13T10:01:30.000Z", pendingBackgroundTasks: [{ taskId: "a", kind: "subagent" }] }),
     ] });
@@ -90,6 +94,9 @@ describe("T3 V2 shell adapter", () => {
     assert.deepEqual(byId.get("done")!.completedTurn, { id: RUN_1, completedAt: "2026-10-13T10:01:30.000Z" });
     assert.equal(byId.get("done")!.status, "ready");
     assert.equal(byId.get("done")!.background, "monitoring");
+    // A background shell command is not live work, matching T3's own thread status.
+    assert.equal(byId.get("shell-only")!.background, null);
+    assert.equal(byId.get("opaque")!.background, "subagents");
     assert.equal(byId.get("failed")!.status, "error");
     assert.equal(byId.get("failed")!.background, "subagents");
     const idle = shell.threads.find((thread) => thread.id === "done")!;
