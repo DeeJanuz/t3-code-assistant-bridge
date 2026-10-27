@@ -12,7 +12,6 @@ DRY_RUN=false
 HTTPS_PORT=8443
 BRIDGE_PORT=8787
 REPLACE_TAILSCALE_HANDLER=false
-DEV_ORIGIN=""
 ARCHIVE_PROJECT_ID=""
 ARCHIVE_WORKSPACE_ROOT=""
 ROLLBACK_SERVICE_INSTALL=false
@@ -49,7 +48,7 @@ rollback_service_install() {
 trap rollback_service_install EXIT
 
 usage() {
-  print -- "Usage: scripts/install.sh [--dry-run] [--https-port PORT] [--bridge-port PORT] [--dev-origin ORIGIN] [--archive-project-id ID --archive-workspace-root DIRECTORY] [--t3-app-path APP_BUNDLE] [--t3-base-dir DIRECTORY] [--t3-url LOOPBACK_ORIGIN] [--replace-tailscale-handler]"
+  print -- "Usage: scripts/install.sh [--dry-run] [--https-port PORT] [--bridge-port PORT] [--archive-project-id ID --archive-workspace-root DIRECTORY] [--t3-app-path APP_BUNDLE] [--t3-base-dir DIRECTORY] [--t3-url LOOPBACK_ORIGIN] [--replace-tailscale-handler]"
 }
 
 while (( $# > 0 )); do
@@ -65,11 +64,6 @@ while (( $# > 0 )); do
     --bridge-port)
       (( $# >= 2 )) || fail "--bridge-port requires a value."
       BRIDGE_PORT="$2"
-      shift
-      ;;
-    --dev-origin)
-      (( $# >= 2 )) || fail "--dev-origin requires a value."
-      DEV_ORIGIN="$2"
       shift
       ;;
     --archive-project-id)
@@ -139,7 +133,7 @@ fi
 validate_port "$HTTPS_PORT" "HTTPS port"
 validate_port "$BRIDGE_PORT" "bridge port"
 [[ "$HTTPS_PORT" != "$BRIDGE_PORT" ]] || fail "HTTPS and bridge ports must differ."
-[[ "$REPO_ROOT" == /* && -f "$REPO_ROOT/app.json" && -f "$REPO_ROOT/bridge/package.json" ]] || fail "Run the installer from a complete T3 Code Assistant Bridge checkout."
+[[ "$REPO_ROOT" == /* && -f "$REPO_ROOT/bridge/src/faceclaw.ts" && -f "$REPO_ROOT/bridge/package.json" ]] || fail "Run the installer from a complete Faceclaw T3 Bridge checkout."
 [[ "$REPO_ROOT" != *$'\n'* && "$REPO_ROOT" != *$'\r'* ]] || fail "Repository path contains invalid data."
 RUNTIME_DIR="$APP_SUPPORT_DIR/runtime"
 if [[ -e "$RUNTIME_DIR" ]]; then
@@ -214,10 +208,6 @@ ensure_node
 "$NODE_PATH" "$SCRIPT_DIR/deployment-helpers.mjs" t3-environment "$CUSTOM_T3_APP_PATH" "$CUSTOM_T3_BASE_DIR" "$CUSTOM_T3_BASE_URL" >/dev/null || fail "Custom T3 configuration is invalid; use an exact numeric loopback HTTP origin."
 ensure_tailscale
 
-if [[ -n "$DEV_ORIGIN" ]]; then
-  DEV_ORIGIN="$("$NODE_PATH" "$SCRIPT_DIR/deployment-helpers.mjs" development-origin "$DEV_ORIGIN")" || fail "The development origin is invalid."
-fi
-
 if $DRY_RUN; then
   TAILSCALE_HOST="your-mac.your-tailnet.ts.net"
 else
@@ -287,7 +277,6 @@ else
 fi
 
 run_or_print /usr/bin/install -d -m 700 "$APP_SUPPORT_DIR" "$LOG_DIR" "$USER_HOME/Library/LaunchAgents"
-run_or_print "$(command_path npm || print npm)" ci --prefix "$REPO_ROOT"
 run_or_print "$(command_path npm || print npm)" ci --prefix "$REPO_ROOT/bridge"
 run_or_print "$NODE_PATH" "$REPO_ROOT/bridge/scripts/setup-whisper.mjs"
 run_or_print "$(command_path npm || print npm)" --prefix "$REPO_ROOT/bridge" run build
@@ -326,7 +315,6 @@ else
     "$TAILSCALE_HOST" \
     "$HTTPS_PORT" \
     "$BRIDGE_PORT" \
-    "$DEV_ORIGIN" \
     "$ARCHIVE_PROJECT_ID" \
     "$ARCHIVE_WORKSPACE_ROOT" \
     "$CUSTOM_T3_APP_PATH" \
@@ -335,10 +323,6 @@ else
   /usr/bin/plutil -lint "$TEMP_PLIST" >/dev/null
   /bin/chmod 600 "$TEMP_PLIST"
 fi
-
-PACKAGE_ARGS=("--tailscale-host" "$TAILSCALE_HOST" "--https-port" "$HTTPS_PORT")
-if $DRY_RUN; then PACKAGE_ARGS+=("--dry-run"); fi
-run_or_print "$NODE_PATH" "$SCRIPT_DIR/package-evenhub.mjs" "${PACKAGE_ARGS[@]}"
 
 if $DRY_RUN; then
   note "DRY RUN: recheck port ownership, stop only the installed LaunchAgent, promote the staged runtime, and require loopback health before enabling Tailscale Serve"
@@ -364,9 +348,9 @@ else
   /bin/mv -f "$TEMP_PLIST" "$LAUNCH_AGENT_PATH"
   "$NODE_PATH" -e '
     const fs = require("fs");
-    const [file, host, httpsPort, bridgePort, developmentOrigin, archiveProjectId, archiveWorkspaceRoot, t3AppPath, t3BaseDir, t3BaseUrl] = process.argv.slice(1);
-    fs.writeFileSync(file, JSON.stringify({ host, httpsPort: Number(httpsPort), bridgePort: Number(bridgePort), developmentOrigin: developmentOrigin || null, archiveProjectId: archiveProjectId || null, archiveWorkspaceRoot: archiveWorkspaceRoot || null, t3AppPath, t3BaseDir, t3BaseUrl }, null, 2) + "\n", { mode: 0o600 });
-  ' "$SERVICE_STATE_PATH" "$TAILSCALE_HOST" "$HTTPS_PORT" "$BRIDGE_PORT" "$DEV_ORIGIN" "$ARCHIVE_PROJECT_ID" "$ARCHIVE_WORKSPACE_ROOT" "$CUSTOM_T3_APP_PATH" "$CUSTOM_T3_BASE_DIR" "$CUSTOM_T3_BASE_URL"
+    const [file, host, httpsPort, bridgePort, archiveProjectId, archiveWorkspaceRoot, t3AppPath, t3BaseDir, t3BaseUrl] = process.argv.slice(1);
+    fs.writeFileSync(file, JSON.stringify({ host, httpsPort: Number(httpsPort), bridgePort: Number(bridgePort), archiveProjectId: archiveProjectId || null, archiveWorkspaceRoot: archiveWorkspaceRoot || null, t3AppPath, t3BaseDir, t3BaseUrl }, null, 2) + "\n", { mode: 0o600 });
+  ' "$SERVICE_STATE_PATH" "$TAILSCALE_HOST" "$HTTPS_PORT" "$BRIDGE_PORT" "$ARCHIVE_PROJECT_ID" "$ARCHIVE_WORKSPACE_ROOT" "$CUSTOM_T3_APP_PATH" "$CUSTOM_T3_BASE_DIR" "$CUSTOM_T3_BASE_URL"
   /bin/launchctl enable "$GUI_DOMAIN/$SERVICE_LABEL"
   /bin/launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH_AGENT_PATH"
   /bin/launchctl kickstart -k "$GUI_DOMAIN/$SERVICE_LABEL"
@@ -392,14 +376,10 @@ ROLLBACK_SERVICE_INSTALL=false
 
 if $DRY_RUN; then
   WSS_URL="$("$NODE_PATH" "$SCRIPT_DIR/deployment-helpers.mjs" events-url "$TAILSCALE_HOST" "$HTTPS_PORT")"
-  note "WebSocket URL: $WSS_URL"
+  note "T3 bridge URL: $WSS_URL"
 else
   "$SCRIPT_DIR/show-connection-info.sh"
-  note "From the T3 Code Assistant Bridge repository root, rerun this connection check any time with: npm run connection-info"
+  note "From the Faceclaw T3 Bridge repository root, rerun this connection check any time with: npm run connection-info"
   note "Service installed. T3 Code must be running for the bridge to connect."
-  note "Upload the generated .ehpk from $APP_SUPPORT_DIR/artifacts/$TAILSCALE_HOST through the Even Hub developer portal."
-  if [[ -n "$DEV_ORIGIN" ]]; then
-    note "Development origin enabled: $DEV_ORIGIN"
-    note "Remove it by rerunning scripts/install.sh without --dev-origin."
-  fi
+  note "In the T3 app's settings, enter the T3 bridge URL above and your pairing passphrase."
 fi

@@ -21,7 +21,7 @@ Locate and execute `whisper-server --help` (`whisper-server.exe` on Windows). Co
 
 ## Discover the existing T3 installation
 
-Locate the installed T3 executable and its server entry. Desktop distributions commonly use `resources/app.asar/apps/server/dist/bin.mjs` (with the host's path separators). An existing CLI installation can use its actual Node executable and server entry instead. The launcher supports Electron plus an ASAR entry, or Node plus a plain JS entry. Do not pass an npm `.cmd` shim as an executable; resolve the underlying executable and JS entry.
+Locate the installed T3 executable. A CLI installation managed by T3's boot service ships a native `t3` executable under `<base dir>/runtime/versions/<version>/t3`; pass it without `--t3-entry`. The launcher then follows T3's active runtime after each self-update. Desktop distributions use the Electron executable plus `resources/app.asar/apps/server/dist/bin.mjs` (with the host's path separators). The launcher supports a native `t3`, Electron plus an ASAR entry, or Node plus a plain JS entry. Do not pass an npm `.cmd` shim as an executable; resolve the underlying executable and JS entry.
 
 Read only the metadata necessary to identify the user's T3 base directory (normally `.t3`), port, and installation. Do not print credentials or open private databases. Confirm that this installed version supports the launcher’s scoped auth commands. Use its existing local server at a numeric loopback URL, default `http://127.0.0.1:3773`; never point local T3 credential exchange at a network URL. T3 Code must be running; this service does not replace its startup policy.
 
@@ -39,8 +39,8 @@ Run the portable installer with resolved absolute arguments, first with `--dry-r
 
 ```text
 node scripts/install-portable.mjs
-  --t3-executable <installed-T3-Electron-or-Node-executable>
-  --t3-entry <installed-T3-server-bin.mjs-or-ASAR-entry>
+  --t3-executable <installed-native-t3-Electron-or-Node-executable>
+  --t3-entry <server-bin.mjs-or-ASAR-entry; omit for the native t3>
   --t3-base-dir <existing-user-T3-data-directory>
   --t3-url http://127.0.0.1:3773
   --whisper-executable <absolute-whisper-server-path>
@@ -52,7 +52,7 @@ node scripts/install-portable.mjs
 
 The block shows arguments, not a directly executable multiline shell command. Pass them as a native argument list, or use correct quoting and the chosen shell's line continuation. Never interpolate user paths into evaluated shell code.
 
-User data goes under `%LOCALAPPDATA%\Even T3 Bridge` on Windows or `~/.local/share/even-t3-bridge` on Linux. Generated credentials and configuration live in `service/credentials.json` and `service/portable-config.json`. The installer reports their paths, not their values. Have the user privately copy `pairingPassphrase` from the credential file into Even Hub; do not read it into the agent transcript.
+User data goes under `%LOCALAPPDATA%\Even T3 Bridge` on Windows or `~/.local/share/even-t3-bridge` on Linux. Generated credentials and configuration live in `service/credentials.json` and `service/portable-config.json`. The installer reports their paths, not their values. Have the user privately copy `pairingPassphrase` from the credential file into the T3 app; do not read it into the agent transcript.
 
 If Serve needs additional permission, keep the user service/config and elevate only the exact reviewed command:
 
@@ -64,10 +64,9 @@ Use the chosen ports. Do not overwrite an existing handler. Verify afterward:
 
 ```sh
 node scripts/portable-info.mjs --verify
-node scripts/package-evenhub.mjs --tailscale-host <actual-device-MagicDNS-name> --https-port 8443
 ```
 
-The verification command emits endpoint URLs, verifies local pairing and rejection without authentication, checks T3 through private HTTPS, and exercises Whisper with synthetic silence through private WSS. Also inspect startup registration and service status; these checks do not replace a physical glasses test. `--output-dir <absolute-path>` is supported for packaging.
+The verification command emits the T3 bridge URL, verifies local native pairing and rejection without authentication, checks T3 through private HTTPS, and exercises Whisper with synthetic silence through private WSS. Also inspect startup registration and service status; these checks do not replace a physical glasses test.
 
 ## Operate and remove
 

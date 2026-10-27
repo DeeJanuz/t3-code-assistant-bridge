@@ -2,14 +2,14 @@
 
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
-import { access, lstat, readFile, readdir, realpath } from "node:fs/promises";
+import { access, lstat, readFile, realpath } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { nativeToken } from "./portable-deployment.mjs";
 import {
-  normalizeDevelopmentOrigin,
   normalizeTailscaleDnsName,
   tailscaleOrigins,
   tailscaleServePortState,
@@ -95,9 +95,9 @@ function rpc(socket, id, method, params = {}, timeoutMs = 15_000) {
   });
 }
 
-async function openSocket(url, token, origin) {
+async function openSocket(url, token) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url, ["even-t3-v1", `auth.${token}`], { origin });
+    const socket = new WebSocket(url, ["even-t3-v1", `auth.${token}`]);
     const timeout = setTimeout(() => {
       socket.terminate();
       reject(new Error("Private WSS connection timed out"));
@@ -136,12 +136,6 @@ async function main() {
   ) {
     fail("LaunchAgent does not clear the inherited GUI environment");
   }
-  if (
-    !plist.includes("<string>BRIDGE_ALLOW_EVEN_LOOPBACK_ORIGIN=true</string>") ||
-    !plist.includes("<string>BRIDGE_ALLOW_NO_ORIGIN=false</string>")
-  ) {
-    fail("LaunchAgent must enable the Even loopback origin policy and deny missing origins");
-  }
   note("Credential and LaunchAgent permissions: ok");
 
   let state;
@@ -153,9 +147,6 @@ async function main() {
   const host = normalizeTailscaleDnsName(state.host);
   const httpsPort = validatePort(state.httpsPort, "HTTPS port");
   const bridgePort = validatePort(state.bridgePort, "bridge port");
-  const developmentOrigin = state.developmentOrigin === null || state.developmentOrigin === undefined
-    ? null
-    : normalizeDevelopmentOrigin(state.developmentOrigin);
   const origins = tailscaleOrigins(host, httpsPort);
 
   await execFileAsync("/bin/launchctl", ["print", `${guiDomain}/${label}`], {
@@ -187,42 +178,18 @@ async function main() {
   const privateHttps = new URL(origins.httpsOrigin);
   await expectStatus(new URL("/health", loopback), 200);
   await expectStatus(new URL("/health", privateHttps), 200);
-  await expectStatus(new URL("/v1/status", privateHttps), 403, {
-    headers: { Origin: "https://attacker.invalid" },
-  });
-  await expectStatus(new URL("/v1/status", privateHttps), 401, {
-    headers: { Origin: "null" },
-  });
-  if (developmentOrigin !== null) {
-    await expectStatus(new URL("/v1/status", privateHttps), 401, {
-      headers: { Origin: developmentOrigin },
+  for (const origin of ["https://attacker.invalid", "null", "http://127.0.0.1:43751"]) {
+    await expectStatus(new URL("/v1/status", privateHttps), 403, { headers: { Origin: origin } });
+    await expectStatus(new URL("/v1/faceclaw/pair", privateHttps), 403, {
+      method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: JSON.stringify({ passphrase }),
     });
   }
-  note("Health, origin denial, and missing-auth denial: ok");
+  await expectStatus(new URL("/v1/status", privateHttps), 401);
+  note("Health, browser-origin denial, and missing-auth denial: ok");
 
-  const clientOrigin = "http://127.0.0.1:43751";
-  for (const origin of [clientOrigin, "http://127.0.0.1:50496"]) {
-    const preflight = await fetch(new URL("/v1/pair", privateHttps), {
-      method: "OPTIONS",
-      headers: { Origin: origin, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type" },
-      redirect: "error",
-      signal: AbortSignal.timeout(5000),
-    });
-    await preflight.body?.cancel();
-    if (preflight.status !== 204 || preflight.headers.get("Access-Control-Allow-Origin") !== origin || preflight.headers.get("Vary") !== "Origin") {
-      fail("Even phone-local pairing preflight failed");
-    }
-    await expectStatus(new URL("/v1/status", privateHttps), 401, { headers: { Origin: origin } });
-  }
-  for (const origin of ["http://localhost:43751", "http://127.0.0.1.attacker.invalid:43751"]) {
-    await expectStatus(new URL("/v1/pair", privateHttps), 403, {
-      method: "OPTIONS", headers: { Origin: origin },
-    });
-  }
-  note("Phone-local preflight at changing ports, exact CORS response, and origin rejection: ok");
-  const pairing = await fetch(new URL("/v1/pair", privateHttps), {
+  const pairing = await fetch(new URL("/v1/faceclaw/pair", privateHttps), {
     method: "POST",
-    headers: { Origin: clientOrigin, "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ passphrase }),
     redirect: "error",
     signal: AbortSignal.timeout(5000),
@@ -234,14 +201,13 @@ async function main() {
   } catch {
     fail("Pairing returned invalid JSON");
   }
-  if (pairing.status !== 200 || pairingValue?.token !== token) fail("Pairing did not return the installed token");
-  if (pairing.headers.get("Access-Control-Allow-Origin") !== clientOrigin) fail("Pairing did not echo the approved origin");
-  await expectStatus(new URL("/v1/status", privateHttps), 200, {
-    headers: { Origin: clientOrigin, Authorization: `Bearer ${token}` },
-  });
-  note("Pairing and authenticated HTTPS: ok");
+  const native = nativeToken(token);
+  if (pairing.status !== 200 || pairingValue?.token !== native) fail("Pairing did not return the installed native token");
+  await expectStatus(new URL("/v1/status", privateHttps), 401, { headers: { Authorization: `Bearer ${native}` } });
+  await expectStatus(new URL("/v1/status", privateHttps), 200, { headers: { Authorization: `Bearer ${token}` } });
+  note("Native pairing, owner/native credential separation, and authenticated HTTPS: ok");
 
-  const socket = await openSocket(origins.eventsUrl, token, clientOrigin);
+  const socket = await openSocket(origins.eventsUrl, native);
   try {
     const sessions = await rpc(socket, "verify-sessions", "sessions.list");
     if (sessions?.error || !sessions?.result || !Array.isArray(sessions.result.unsettled)) {
@@ -261,22 +227,14 @@ async function main() {
   }
   note("Authenticated WSS, T3 read, and local Whisper inference: ok");
 
-  const artifactDirectory = path.join(appSupport, "artifacts", host);
-  const artifactNames = await readdir(artifactDirectory);
-  const packageName = artifactNames.find((name) => name.endsWith(".ehpk"));
-  if (!packageName) fail("Generated Even Hub package is missing");
-  const [packageBytes, logBytes] = await Promise.all([
-    readFile(path.join(artifactDirectory, packageName)),
-    Promise.all([
-      readFile(path.join(homedir(), "Library", "Logs", "Even T3 Bridge", "bridge.log")).catch(() => Buffer.alloc(0)),
-      readFile(path.join(homedir(), "Library", "Logs", "Even T3 Bridge", "bridge.error.log")).catch(() => Buffer.alloc(0)),
-    ]).then((values) => Buffer.concat(values)),
-  ]);
-  for (const secret of [Buffer.from(token), Buffer.from(passphrase)]) {
-    if (packageBytes.includes(secret)) fail("Generated package contains a stored credential");
+  const logBytes = await Promise.all([
+    readFile(path.join(homedir(), "Library", "Logs", "Even T3 Bridge", "bridge.log")).catch(() => Buffer.alloc(0)),
+    readFile(path.join(homedir(), "Library", "Logs", "Even T3 Bridge", "bridge.error.log")).catch(() => Buffer.alloc(0)),
+  ]).then((values) => Buffer.concat(values));
+  for (const secret of [Buffer.from(token), Buffer.from(passphrase), Buffer.from(native)]) {
     if (logBytes.includes(secret)) fail("Service logs contain a stored credential");
   }
-  note("Package and log credential scan: ok");
+  note("Log credential scan: ok");
   note(`Deployment verified: ${origins.eventsUrl}`);
 }
 

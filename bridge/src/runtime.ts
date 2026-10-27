@@ -2,6 +2,7 @@ import type { Server } from 'node:http';
 import { ApiError } from './security.js';
 import { createBridgeServer } from './server.js';
 import { HttpT3Client } from './t3-client.js';
+import { ManagedEnvironmentRouter } from './environment-router.js';
 import { WhisperCppTranscriber } from './voice.js';
 import type { BridgeConfig, T3Client, T3Descriptor, Transcriber } from './types.js';
 
@@ -38,9 +39,25 @@ export class RecoveringT3Client implements T3Client {
     return client.threadPage(id, cursor);
   }
   async modelCatalog() { return this.ready().modelCatalog(); }
+  async setModel(input: Parameters<NonNullable<T3Client['setModel']>>[0]) {
+    const client = this.ready();
+    if (!client.setModel) throw new ApiError(502, 'upstream_incompatible', 'Session model controls are unavailable');
+    return client.setModel(input);
+  }
+  async setReasoning(input: Parameters<NonNullable<T3Client['setReasoning']>>[0]) {
+    const client = this.ready();
+    if (!client.setReasoning) throw new ApiError(502, 'upstream_incompatible', 'Session reasoning controls are unavailable');
+    return client.setReasoning(input);
+  }
+  async approvePlan(input: Parameters<NonNullable<T3Client['approvePlan']>>[0]) {
+    const client = this.ready();
+    if (!client.approvePlan) throw new ApiError(502, 'upstream_incompatible', 'Plan approval is unavailable');
+    return client.approvePlan(input);
+  }
   async startSession(input: Parameters<T3Client['startSession']>[0]) { return this.ready().startSession(input); }
   async sendMessage(input: Parameters<T3Client['sendMessage']>[0]) { return this.ready().sendMessage(input); }
   async steerMessage(input: Parameters<T3Client['steerMessage']>[0]) { return this.ready().steerMessage(input); }
+  async replyMessage(input: Parameters<T3Client['replyMessage']>[0]) { return this.ready().replyMessage(input); }
   async settleThread(id: string) { return this.ready().settleThread(id); }
   async respondToPlanInput(input: Parameters<T3Client['respondToPlanInput']>[0]) { return this.ready().respondToPlanInput(input); }
 }
@@ -68,16 +85,22 @@ export function startBridgeRuntime(config: BridgeConfig): BridgeRuntime {
     ...(config.additionalRedactionSecrets?.() ?? []), ...tokens,
   ] };
   const client = new RecoveringT3Client(runtimeConfig);
+  const environments = new ManagedEnvironmentRouter();
   const transcriber = new RecoveringTranscriber();
-  const server = createBridgeServer(runtimeConfig, client, transcriber);
+  const server = createBridgeServer(runtimeConfig, environments, transcriber);
   server.listen(config.port, config.host, () => process.stdout.write(`${JSON.stringify({
     level: 'info', message: 'Even bridge listening', host: config.host, port: config.port,
     at: new Date().toISOString(),
   })}\n`));
   return {
     server,
-    useT3Token: token => { tokens.add(token); return client.useToken(token); },
-    clearT3: () => client.clear(),
+    useT3Token: async token => {
+      tokens.add(token);
+      const descriptor = await client.useToken(token);
+      environments.register({ descriptor, kind: 'local', client, primary: true });
+      return descriptor;
+    },
+    clearT3: () => { client.clear(); environments.removePrimary(); },
     useWhisper: url => {
       if (url !== null && (url.protocol !== 'http:' || !['127.0.0.1', '[::1]'].includes(url.hostname) ||
         url.username || url.password || url.search || url.hash || !url.pathname.endsWith('/inference'))) {

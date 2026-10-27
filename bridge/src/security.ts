@@ -1,6 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { BridgeConfig } from "./types.js";
 
 export class ApiError extends Error {
   constructor(
@@ -50,38 +49,12 @@ export function websocketToken(request: IncomingMessage): string | undefined {
   return undefined;
 }
 
-export function requestOrigin(request: IncomingMessage): string | undefined {
-  const value = request.headers.origin;
-  return typeof value === "string" ? value : undefined;
-}
-
-export function originAllowed(request: IncomingMessage, config: BridgeConfig): boolean {
-  const origin = requestOrigin(request);
-  if (origin === undefined) return config.allowNoOrigin;
-  if (config.allowedOrigins.has(origin)) return true;
-  if (!config.allowEvenLoopbackOrigin) return false;
-  // Match the raw serialized origin, not a URL-normalized hostname. URL parsing
-  // accepts alternate numeric IP spellings and strips paths/credentials.
-  const match = /^http:\/\/127\.0\.0\.1(?::([1-9][0-9]{0,4}))?$/.exec(origin);
-  return match !== null && match[0] === origin &&
-    (match[1] === undefined || Number(match[1]) <= 65_535);
-}
-
-export function applySecurityHeaders(
-  request: IncomingMessage,
-  response: ServerResponse,
-  config: BridgeConfig,
-): void {
+export function applySecurityHeaders(response: ServerResponse): void {
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
   response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("X-Frame-Options", "DENY");
-  response.setHeader("Vary", "Origin");
-  const origin = requestOrigin(request);
-  if (origin !== undefined && originAllowed(request, config)) {
-    response.setHeader("Access-Control-Allow-Origin", origin);
-  }
 }
 
 export function sendJson(

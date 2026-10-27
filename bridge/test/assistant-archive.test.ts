@@ -53,6 +53,16 @@ archiveTest("exports all pages, merges stable colon IDs, and never fetches unrel
   assert.equal((await f.store.state("thread-1"))!.messages.length, 201);
 });
 
+archiveTest("keeps recorded turn ids when T3 V2 imports history without them", async () => {
+  const f = await fixture([page(thread([message(0)]))]);
+  await f.archive.poll();
+  f.history[0] = page(thread([message(0, { turnId: null })], { latestTurn: null, session: null, updatedAt: "2026-10-13T08:01:00.000Z" }));
+  await f.archive.poll();
+  const state = (await f.store.state("thread-1"))!;
+  assert.equal(state.sourceUpdatedAt, "2026-10-13T08:01:00.000Z");
+  assert.equal(state.messages[0]!.turnId, "turn-0");
+});
+
 archiveTest("only exports settled user-visible text and allowlisted approval decisions", async () => {
   const item = thread([message(0), message(1, { role: "system", text: "SECRET SYSTEM PROMPT" }) as never, message(2, { streaming: true }), message(3, { text: 'hello test-upstream-secret sk-proj-AbCdEf1234567890 ![[file]]' })], {
     activities: [{ id: "activity:approval", kind: "approval.resolved", createdAt: at, turnId: "turn-0", payload: { decision: "accept", secret: "RAW SECRET" } }, { id: "activity:tool", kind: "tool.completed", createdAt: at, turnId: "turn-0", payload: { status: "completed", stdout: "RAW TOOL TRACE" } }],

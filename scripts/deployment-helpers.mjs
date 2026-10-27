@@ -1,4 +1,4 @@
-import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
+import { writeFile, rename, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -42,50 +42,8 @@ export function tailscaleOrigins(host, httpsPort) {
   return {
     httpsOrigin: `https://${authority}`,
     wssOrigin: `wss://${authority}`,
-    eventsUrl: `wss://${authority}/v1/events`,
+    eventsUrl: `wss://${authority}/v1/faceclaw/events`,
   };
-}
-
-export function tailscaleWildcardOrigins(httpsPort) {
-  const port = validatePort(httpsPort, "HTTPS port");
-  const authorities = ["*.ts.net", "*.*.ts.net"]
-    .map((host) => port === 443 ? host : `${host}:${port}`);
-  return authorities.flatMap((authority) => [
-    `https://${authority}`,
-    `wss://${authority}`,
-  ]);
-}
-
-export function nextPatchVersion(raw) {
-  if (typeof raw !== "string" || raw.length > 64) {
-    throw new Error("app.json version must be a semantic version");
-  }
-  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(raw);
-  if (match === null) throw new Error("app.json version must be a semantic version");
-  const version = `${match[1]}.${match[2]}.${BigInt(match[3]) + 1n}`;
-  if (version.length > 64) throw new Error("next app version is too long");
-  return version;
-}
-
-export function normalizeDevelopmentOrigin(raw) {
-  if (typeof raw !== "string" || raw.length === 0 || raw.length > 2048 || /[\u0000\r\n]/.test(raw)) {
-    throw new Error("Development origin is invalid");
-  }
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error("Development origin is invalid");
-  }
-  if (
-    !["http:", "https:"].includes(url.protocol) ||
-    url.username ||
-    url.password ||
-    url.origin !== raw
-  ) {
-    throw new Error("Development origin must be one exact HTTP or HTTPS origin without credentials or a path");
-  }
-  return url.origin;
 }
 
 export function tailscaleServePortState(status, host, httpsPort, bridgePort) {
@@ -126,44 +84,6 @@ export function tailscaleServePortState(status, host, httpsPort, bridgePort) {
     return "ours";
   }
   return "conflict";
-}
-
-export function deploymentManifest(source, options) {
-  if (typeof source !== "object" || source === null || Array.isArray(source)) {
-    throw new Error("app.json must contain a JSON object");
-  }
-  const permissions = source.permissions;
-  if (!Array.isArray(permissions)) throw new Error("app.json permissions are missing");
-  const networkIndexes = permissions
-    .map((permission, index) => permission?.name === "network" ? index : -1)
-    .filter((index) => index >= 0);
-  if (networkIndexes.length !== 1) {
-    throw new Error("app.json must contain exactly one network permission");
-  }
-  const wildcard = options.tailscaleWildcard === true;
-  if (wildcard && options.host !== undefined && options.host !== null) {
-    throw new Error("A wildcard manifest cannot include a Tailscale host");
-  }
-  if (wildcard && options.includeLocalDevelopment === true) {
-    throw new Error("A wildcard manifest cannot include local development origins");
-  }
-  const whitelist = wildcard
-    ? tailscaleWildcardOrigins(options.httpsPort)
-    : (() => {
-        const { httpsOrigin, wssOrigin } = tailscaleOrigins(options.host, options.httpsPort);
-        return [httpsOrigin, wssOrigin];
-      })();
-  if (options.includeLocalDevelopment === true) {
-    whitelist.push(
-      "http://127.0.0.1:8787",
-      "http://localhost:8787",
-      "ws://127.0.0.1:8787",
-      "ws://localhost:8787",
-    );
-  }
-  const clone = structuredClone(source);
-  clone.permissions[networkIndexes[0]].whitelist = whitelist;
-  return clone;
 }
 
 function xml(value) {
@@ -242,22 +162,12 @@ export function launchAgentPlist(options) {
     }
     if (/[\u0000\r\n]/.test(value)) throw new Error(`${name} contains invalid data`);
   }
-  const allowedOrigins = ["null"];
-  if (options.developmentOrigin !== undefined && options.developmentOrigin !== null) {
-    allowedOrigins.push(normalizeDevelopmentOrigin(options.developmentOrigin));
-  }
   const serviceEnvironment = {
     ...archiveEnvironment(options.archiveProjectId, options.archiveWorkspaceRoot),
     NODE_EXECUTABLE: options.nodeExecutable,
     PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
     BRIDGE_HOST: "127.0.0.1",
     BRIDGE_PORT: String(bridgePort),
-    // Even WebViews use either an opaque "null" origin or phone-local HTTP
-    // on 127.0.0.1 at an ephemeral port. Neither is the Tailscale destination.
-    // Origins are not app identity; authentication remains required.
-    BRIDGE_ALLOWED_ORIGINS: allowedOrigins.join(","),
-    BRIDGE_ALLOW_EVEN_LOOPBACK_ORIGIN: "true",
-    BRIDGE_ALLOW_NO_ORIGIN: "false",
     ...macT3Environment(options),
   };
   const document = {
@@ -346,47 +256,12 @@ async function cli() {
     process.stdout.write(`${JSON.stringify(macT3Environment({ t3AppPath, t3BaseDir, t3BaseUrl }))}\n`);
     return;
   }
-  if (command === "development-origin") {
-    const [origin] = args;
-    if (typeof origin !== "string") throw new Error("development-origin requires an origin");
-    process.stdout.write(`${normalizeDevelopmentOrigin(origin)}\n`);
-    return;
-  }
   if (command === "events-url") {
     const [host, httpsPort] = args;
     if (typeof host !== "string" || typeof httpsPort !== "string") {
       throw new Error("events-url requires a Tailscale host and HTTPS port");
     }
     process.stdout.write(`${tailscaleOrigins(host, httpsPort).eventsUrl}\n`);
-    return;
-  }
-  if (command === "manifest") {
-    const [sourcePath, outputPath, host, port, local = "false"] = args;
-    if (![sourcePath, outputPath, host, port].every((value) => typeof value === "string")) {
-      throw new Error("manifest requires source, output, host, and port");
-    }
-    const source = JSON.parse(await readFile(sourcePath, "utf8"));
-    const manifest = deploymentManifest(source, {
-      host,
-      httpsPort: port,
-      includeLocalDevelopment: local === "true",
-    });
-    await atomicWrite(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    return;
-  }
-  if (command === "manifest-tailscale-wildcard") {
-    const [sourcePath, outputPath, port] = args;
-    if (![sourcePath, outputPath, port].every((value) => typeof value === "string")) {
-      throw new Error("manifest-tailscale-wildcard requires source, output, and port");
-    }
-    const source = JSON.parse(await readFile(sourcePath, "utf8"));
-    const manifest = deploymentManifest(source, {
-      tailscaleWildcard: true,
-      httpsPort: port,
-      includeLocalDevelopment: false,
-    });
-    manifest.version = nextPatchVersion(source.version);
-    await atomicWrite(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);
     return;
   }
   if (command === "launch-agent") {
@@ -401,14 +276,13 @@ async function cli() {
       host,
       httpsPort,
       bridgePort,
-      developmentOrigin = "",
       archiveProjectId = "",
       archiveWorkspaceRoot = "",
       t3AppPath = "",
       t3BaseDir = "",
       t3BaseUrl = "",
     ] = args;
-    if ([outputPath, label, runnerPath, workingDirectory, nodeExecutable, stdoutPath, stderrPath, host, httpsPort, bridgePort, developmentOrigin]
+    if ([outputPath, label, runnerPath, workingDirectory, nodeExecutable, stdoutPath, stderrPath, host, httpsPort, bridgePort]
       .some((value) => typeof value !== "string")) {
       throw new Error("launch-agent requires all deployment values");
     }
@@ -422,7 +296,6 @@ async function cli() {
       host,
       httpsPort,
       bridgePort,
-      developmentOrigin: developmentOrigin || null,
       archiveProjectId,
       archiveWorkspaceRoot,
       t3AppPath,

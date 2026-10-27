@@ -338,7 +338,9 @@ export class AssistantArchive {
             id(attachment.id); files.push(redactText(`${attachment.name} [attachment ${attachment.id}]`, secrets));
           }
         }
-        messages.set(raw.id, { id: raw.id, role: raw.role, text: redactText(raw.text, secrets), createdAt: raw.createdAt, turnId: raw.turnId, files });
+        // T3 V2 imports V1 history without turn ids; keep the id this archive recorded before.
+        const turnId = raw.turnId ?? messages.get(raw.id)?.turnId ?? null;
+        messages.set(raw.id, { id: raw.id, role: raw.role, text: redactText(raw.text, secrets), createdAt: raw.createdAt, turnId, files });
       }
       for (const activity of thread.activities ?? []) {
         if (!record(activity) || !["approval.resolved", "tool.completed", "tool.denied"].includes(String(activity.kind))) continue;

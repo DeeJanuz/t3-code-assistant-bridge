@@ -36,7 +36,7 @@ Operation:
 ./scripts/service.sh logs
 ```
 
-Use the filtered status/log helpers; avoid raw launchctl or environment dumps. Run `node scripts/package-evenhub.mjs` to regenerate an exact-host package. A manually supplied hostname uses `--tailscale-host HOST --https-port PORT`; `--output-dir PATH` chooses an output directory.
+Use the filtered status/log helpers; avoid raw launchctl or environment dumps. Run `npm run connection-info` to print the T3 bridge URL again.
 
 For a requested uninstall, inspect `scripts/uninstall.sh` and its options first. Default removal retains credentials and Tailscale Serve. Use `--purge-secrets` or `--remove-tailscale-serve` only for explicitly requested removal of those resources.
 

@@ -7,15 +7,15 @@ export type RuntimeMode =
   | "full-access";
 
 export interface BridgeConfig {
+  readonly peerDirectory?: string;
+  readonly signal?: { readonly cliPath: string; readonly dataDirectory: string };
+  readonly faceclawProjectId?: string;
+  readonly refinementCodexPath?: string;
   readonly archive?: { readonly projectId: string; readonly workspaceRoot: string } | null;
   readonly host: string;
   readonly port: number;
   readonly bridgeToken: string;
   readonly bridgePassphrase: string | null;
-  readonly allowedOrigins: ReadonlySet<string>;
-  /** Opt-in for Even's phone-local HTTP WebView on 127.0.0.1 at changing ports. */
-  readonly allowEvenLoopbackOrigin: boolean;
-  readonly allowNoOrigin: boolean;
   readonly projectIds: ReadonlySet<string> | null;
   readonly runtimeMode: RuntimeMode;
   readonly pollIntervalMs: number;
@@ -113,6 +113,12 @@ export interface T3SessionState {
 
 export interface T3ThreadShell {
   readonly hasPendingUserInput?: boolean;
+  /**
+   * In-memory T3 state for work that outlives the turn: "working" while
+   * subagents or workflows run, "monitoring" when only watch loops remain.
+   * Untrusted; read it through `sessionBackground`.
+   */
+  readonly backgroundLiveness?: unknown;
   readonly id: string;
   readonly projectId: string;
   readonly title: string;
@@ -125,12 +131,15 @@ export interface T3ThreadShell {
   readonly settledOverride: "settled" | "active" | null;
   readonly settledAt: string | null;
   readonly unsettledAt?: string | null;
+  /** T3 runs each subagent in a child thread; its sidebar nests these under the parent. */
+  readonly subagent?: boolean;
   readonly latestUserMessageAt?: string | null;
   readonly latestTurn: T3LatestTurn | null;
   readonly session: T3SessionState | null;
 }
 
 export interface T3Message {
+  readonly attachments?: readonly unknown[];
   readonly id: string;
   readonly role: "user" | "assistant" | "system";
   readonly text: string;
@@ -142,6 +151,7 @@ export interface T3Message {
 
 /** Activity metadata read from the untrusted T3 response. Payload fields stay opaque. */
 export interface T3ThreadActivity {
+  readonly id?: unknown;
   readonly kind?: unknown;
   readonly turnId?: unknown;
   readonly createdAt?: unknown;
@@ -167,6 +177,8 @@ export interface T3LiveToolActivity {
 export interface T3Thread extends T3ThreadShell {
   readonly messages: readonly T3Message[];
   readonly activities?: readonly T3ThreadActivity[];
+  /** Structured proposed plans are untrusted upstream data. */
+  readonly proposedPlans?: readonly unknown[];
 }
 
 export interface T3ShellSnapshot {
@@ -189,7 +201,43 @@ export interface T3Descriptor {
   readonly capabilities: Record<string, unknown>;
 }
 
+export type T3EnvironmentKind = "local" | "peer" | "t3-connect" | "bearer" | "ssh" | "wsl";
+export type T3EnvironmentStatus = "connected" | "connecting" | "offline" | "error";
+
+/** Public, secret-free environment state exposed by the bridge. */
+export interface BridgeEnvironment {
+  readonly environmentId: string;
+  readonly label: string;
+  readonly kind: T3EnvironmentKind;
+  readonly status: T3EnvironmentStatus;
+  readonly isPrimary: boolean;
+  readonly serverVersion?: string;
+  readonly errorCode?: string;
+}
+
+export interface ResolvedT3Environment {
+  readonly environment: BridgeEnvironment;
+  readonly client: T3Client;
+}
+
+export interface T3EnvironmentSnapshot extends ResolvedT3Environment {
+  readonly shell: T3ShellSnapshot;
+}
+
+export interface T3EnvironmentRouter {
+  list(): Promise<readonly BridgeEnvironment[]>;
+  resolve(environmentId?: string): Promise<ResolvedT3Environment>;
+  primary(): Promise<ResolvedT3Environment>;
+  snapshots(): Promise<{
+    readonly available: readonly T3EnvironmentSnapshot[];
+    readonly environments: readonly BridgeEnvironment[];
+  }>;
+}
+
 export interface T3Client {
+  setModel?(input: { readonly thread: T3ThreadShell; readonly selection: T3NewSessionSelection }): Promise<{ readonly sequence: number }>;
+  setReasoning?(input: { readonly thread: T3ThreadShell; readonly reasoningId: string }): Promise<{ readonly sequence: number }>;
+  approvePlan?(input: { readonly thread: T3ThreadShell; readonly planId: string; readonly planMarkdown: string; readonly commandId: string }): Promise<{ readonly sequence: number }>;
   settleThread(threadId: string): Promise<{ readonly sequence: number }>;
   respondToPlanInput(input: {
     readonly threadId: string;
@@ -212,8 +260,14 @@ export interface T3Client {
   sendMessage(input: {
     readonly thread: T3ThreadShell;
     readonly text: string;
+    readonly interactionMode?: "default" | "plan";
+    readonly reasoningId?: string;
   }): Promise<{ readonly sequence: number }>;
   steerMessage(input: {
+    readonly thread: T3ThreadShell;
+    readonly text: string;
+  }): Promise<{ readonly sequence: number }>;
+  replyMessage(input: {
     readonly thread: T3ThreadShell;
     readonly text: string;
   }): Promise<{ readonly sequence: number }>;

@@ -1,37 +1,19 @@
 {
-  "name": "t3-code-assistant-bridge",
+  "name": "faceclaw-t3-bridge",
   "private": true,
-  "version": "0.5.7",
+  "version": "0.6.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
-    "build": "tsc --noEmit && vite build",
-    "test": "vitest run src",
-    "check": "npm run test && npm run build",
-    "check:all": "npm run check && npm run test:deployment && npm --prefix bridge run typecheck && npm --prefix bridge test && npm --prefix bridge run build",
-    "simulate": "evenhub-simulator --automation-port 9898 http://localhost:5178",
-    "pack": "npm run build && evenhub pack app.json dist -o t3-code-assistant-0.5.7.ehpk --sdk-ver 0.0.14",
+    "check:all": "npm run test:deployment && npm --prefix bridge run typecheck && npm --prefix bridge test && npm --prefix bridge run build",
+    "test:deployment": "node --test scripts/deployment-helpers.test.mjs scripts/portable-deployment.test.mjs",
     "deploy:install": "./scripts/install.sh",
     "deploy:status": "./scripts/service.sh status",
     "connection-info": "./scripts/show-connection-info.sh",
-    "deploy:package": "./scripts/package-evenhub.mjs",
-    "test:deployment": "node --test scripts/deployment-helpers.test.mjs scripts/portable-deployment.test.mjs",
-    "dev:phone": "npm --prefix bridge run build && node scripts/phone-dev-server.mjs"
-  },
-  "dependencies": {
-    "@evenrealities/even_hub_sdk": "0.0.14",
-    "@evenrealities/pretext": "0.1.4"
-  },
-  "devDependencies": {
-    "@evenrealities/evenhub-cli": "0.1.14",
-    "@evenrealities/evenhub-simulator": "0.9.5",
-    "typescript": "5.9.3",
-    "vite": "8.2.2",
-    "vitest": "4.1.11"
+    "peers": "node scripts/peers.mjs"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/DeeJanuz/t3-code-assistant-bridge.git"
+    "url": "https://github.com/DeeJanuz/faceclaw-t3-bridge.git"
   }
 }

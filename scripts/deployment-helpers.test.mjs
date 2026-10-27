@@ -5,15 +5,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
-  deploymentManifest,
   launchAgentPlist,
   launchctlStatusSummary,
-  normalizeDevelopmentOrigin,
   normalizeTailscaleDnsName,
-  nextPatchVersion,
   tailscaleInfoFromStatus,
   tailscaleOrigins,
-  tailscaleWildcardOrigins,
   tailscaleServePortState,
   validatePort,
 } from "./deployment-helpers.mjs";
@@ -43,20 +39,13 @@ test("rejects disconnected status and attacker-controlled host syntax", () => {
   assert.throws(() => validatePort("8443x"), /integer/);
 });
 
-test("accepts only one exact HTTP or HTTPS development origin", () => {
-  assert.equal(normalizeDevelopmentOrigin("http://192.0.2.15:5178"), "http://192.0.2.15:5178");
-  assert.equal(normalizeDevelopmentOrigin("https://dev.example.test"), "https://dev.example.test");
-  for (const value of [
-    "*",
-    "null",
-    "ws://192.0.2.15:5178",
-    "http://192.0.2.15:5178/",
-    "http://user:password@192.0.2.15:5178",
-    "http://192.0.2.15:5178/path",
-    "http://192.0.2.15:5178\nInjected",
-  ]) {
-    assert.throws(() => normalizeDevelopmentOrigin(value), /Development origin/);
-  }
+test("derives the native Faceclaw events URL from the Tailscale host", () => {
+  assert.deepEqual(tailscaleOrigins("mac.example.ts.net", 8443), {
+    httpsOrigin: "https://mac.example.ts.net:8443",
+    wssOrigin: "wss://mac.example.ts.net:8443",
+    eventsUrl: "wss://mac.example.ts.net:8443/v1/faceclaw/events",
+  });
+  assert.equal(tailscaleOrigins("mac.example.ts.net", 443).eventsUrl, "wss://mac.example.ts.net/v1/faceclaw/events");
 });
 
 test("classifies only the exact loopback Serve handler as owned", () => {
@@ -87,131 +76,6 @@ test("classifies only the exact loopback Serve handler as owned", () => {
   );
 });
 
-test("creates an exact deployment whitelist without changing the tracked manifest object", () => {
-  const source = {
-    name: "T3 Code Assistant",
-    permissions: [
-      { name: "network", desc: "bridge", whitelist: ["https://old.example"] },
-      { name: "g2-microphone", desc: "voice" },
-    ],
-  };
-  const result = deploymentManifest(source, {
-    host: "mac.example.ts.net",
-    httpsPort: 8443,
-    includeLocalDevelopment: false,
-  });
-  assert.deepEqual(result.permissions[0].whitelist, [
-    "https://mac.example.ts.net:8443",
-    "wss://mac.example.ts.net:8443",
-  ]);
-  assert.deepEqual(source.permissions[0].whitelist, ["https://old.example"]);
-});
-
-test("declares phone location and retains it in exact and wildcard deployment manifests", async () => {
-  const source = JSON.parse(await readFile(new URL("../app.json", import.meta.url), "utf8"));
-  const location = source.permissions.filter(permission => permission.name === "location");
-  assert.equal(location.length, 1);
-  assert.equal(typeof location[0].desc, "string");
-  assert.ok(location[0].desc.length > 0);
-  assert.equal(location[0].whitelist, undefined);
-  for (const options of [
-    { host: "mac.example.ts.net", httpsPort: 8443, includeLocalDevelopment: false },
-    { host: "mac.example.ts.net", httpsPort: 8443, includeLocalDevelopment: true },
-    { tailscaleWildcard: true, httpsPort: 8443 },
-  ]) {
-    const result = deploymentManifest(source, options);
-    assert.deepEqual(result.permissions.filter(permission => permission.name === "location"), location);
-  }
-});
-
-test("adds only fixed loopback entries when local development is requested", () => {
-  const result = deploymentManifest(
-    { permissions: [{ name: "network", whitelist: [] }] },
-    { host: "mac.example.ts.net", httpsPort: 443, includeLocalDevelopment: true },
-  );
-  assert.deepEqual(result.permissions[0].whitelist, [
-    "https://mac.example.ts.net",
-    "wss://mac.example.ts.net",
-    "http://127.0.0.1:8787",
-    "http://localhost:8787",
-    "ws://127.0.0.1:8787",
-    "ws://localhost:8787",
-  ]);
-  assert.equal(tailscaleOrigins("mac.example.ts.net", 443).eventsUrl, "wss://mac.example.ts.net/v1/events");
-});
-
-test("creates a narrow Tailscale wildcard manifest without a personal host or local origins", () => {
-  const source = {
-    version: "0.2.1",
-    permissions: [{ name: "network", whitelist: ["https://personal.tailnet.ts.net:8443"] }],
-  };
-  const result = deploymentManifest(source, {
-    tailscaleWildcard: true,
-    httpsPort: 8443,
-    includeLocalDevelopment: false,
-  });
-  assert.deepEqual(result.permissions[0].whitelist, [
-    "https://*.ts.net:8443",
-    "wss://*.ts.net:8443",
-    "https://*.*.ts.net:8443",
-    "wss://*.*.ts.net:8443",
-  ]);
-  assert.equal(JSON.stringify(result).includes("personal.tailnet"), false);
-  assert.equal(result.permissions[0].whitelist.includes("*"), false);
-  assert.deepEqual(source.permissions[0].whitelist, ["https://personal.tailnet.ts.net:8443"]);
-  assert.deepEqual(tailscaleWildcardOrigins(443), [
-    "https://*.ts.net",
-    "wss://*.ts.net",
-    "https://*.*.ts.net",
-    "wss://*.*.ts.net",
-  ]);
-});
-
-test("wildcard manifests reject exact hosts and local development origins", () => {
-  const source = { permissions: [{ name: "network", whitelist: [] }] };
-  assert.throws(() => deploymentManifest(source, {
-    tailscaleWildcard: true,
-    host: "mac.example.ts.net",
-    httpsPort: 8443,
-  }), /cannot include a Tailscale host/);
-  assert.throws(() => deploymentManifest(source, {
-    tailscaleWildcard: true,
-    httpsPort: 8443,
-    includeLocalDevelopment: true,
-  }), /cannot include local development origins/);
-  assert.equal(nextPatchVersion("0.2.1"), "0.2.2");
-  for (const value of ["0.2", "v0.2.1", "1.2.3-beta", "01.2.3", "0.2.3\n"]) {
-    assert.throws(() => nextPatchVersion(value), /semantic version/);
-  }
-});
-
-test("wildcard packaging skips host discovery and rejects conflicting flags", async () => {
-  const script = fileURLToPath(new URL("./package-evenhub.mjs", import.meta.url));
-  const { stdout } = await execFileAsync(process.execPath, [script, "--tailscale-wildcard", "--dry-run"], {
-    env: { ...process.env, PATH: "" },
-  });
-  const output = JSON.parse(stdout);
-  const source = JSON.parse(await readFile(new URL('../app.json', import.meta.url), 'utf8'));
-  const expectedVersion = nextPatchVersion(source.version);
-  assert.equal(output.manifestVersion, expectedVersion);
-  assert.ok(output.packagePath.replaceAll("\\", "/").endsWith(`/tailscale-wildcard-port-8443/t3-code-assistant-tailscale-wildcard-${expectedVersion}.ehpk`));
-  assert.equal(JSON.stringify(output.whitelist).includes("computer.example"), false);
-  assert.deepEqual(output.whitelist, [
-    "https://*.ts.net:8443",
-    "wss://*.ts.net:8443",
-    "https://*.*.ts.net:8443",
-    "wss://*.*.ts.net:8443",
-  ]);
-  await assert.rejects(
-    execFileAsync(process.execPath, [script, "--tailscale-wildcard", "--tailscale-host", "mac.example.ts.net", "--dry-run"]),
-    /cannot be combined with --tailscale-host/,
-  );
-  await assert.rejects(
-    execFileAsync(process.execPath, [script, "--tailscale-wildcard", "--include-local-dev", "--dry-run"]),
-    /cannot be combined with --include-local-dev/,
-  );
-});
-
 test("launch agent keeps all long-lived credentials out of plist data", () => {
   const plist = launchAgentPlist({
     label: "com.example.bridge",
@@ -228,33 +92,12 @@ test("launch agent keeps all long-lived credentials out of plist data", () => {
   assert.match(plist, /<string>\/usr\/bin\/env<\/string>[\s\S]*<string>-i<\/string>/);
   assert.match(plist, /BRIDGE_HOST=127\.0\.0\.1/);
   assert.match(plist, /127\.0\.0\.1/);
-  assert.match(plist, /BRIDGE_ALLOWED_ORIGINS=null/);
-  assert.match(plist, /<string>BRIDGE_ALLOW_EVEN_LOOPBACK_ORIGIN=true<\/string>/);
-  assert.match(plist, /BRIDGE_ALLOW_NO_ORIGIN=false/);
+  assert.equal(plist.includes("ORIGIN"), false);
   assert.equal(plist.includes("<key>EnvironmentVariables</key>"), false);
   assert.equal(plist.includes("https://mac.example.ts.net:8443</string>"), false);
   for (const forbidden of ["BRIDGE_TOKEN", "BRIDGE_PASSPHRASE", "T3_ACCESS_TOKEN"]) {
     assert.equal(plist.includes(forbidden), false);
   }
-});
-
-test("launch agent adds one exact opt-in development origin without weakening other origin controls", () => {
-  const plist = launchAgentPlist({
-    label: "com.example.bridge",
-    runnerPath: "/tmp/run-service.sh",
-    workingDirectory: "/tmp/bridge",
-    nodeExecutable: "/opt/homebrew/bin/node",
-    stdoutPath: "/tmp/out.log",
-    stderrPath: "/tmp/error.log",
-    host: "mac.example.ts.net",
-    httpsPort: 8443,
-    bridgePort: 8787,
-    developmentOrigin: "http://192.0.2.15:5178",
-  });
-  assert.match(plist, /BRIDGE_ALLOWED_ORIGINS=null,http:\/\/192\.0\.2\.15:5178/);
-  assert.match(plist, /<string>BRIDGE_ALLOW_EVEN_LOOPBACK_ORIGIN=true<\/string>/);
-  assert.match(plist, /BRIDGE_ALLOW_NO_ORIGIN=false/);
-  assert.equal(plist.includes("BRIDGE_ALLOWED_ORIGINS=*"), false);
 });
 
 test("launchctl status summary drops inherited environment and arbitrary job data", () => {
@@ -319,7 +162,8 @@ test("installer preflights the Serve port before credentials or filesystem write
   const bootout = script.indexOf('/bin/launchctl bootout "$GUI_DOMAIN/$SERVICE_LABEL"', serviceMutation);
   assert.ok(bootout > script.indexOf('run build'));
   assert.ok(bootout > script.indexOf('ci --omit=dev'));
-  assert.ok(bootout > script.indexOf('package-evenhub.mjs'));
+  assert.ok(script.indexOf('deployment-helpers.mjs" launch-agent') > 0);
+  assert.ok(bootout > script.indexOf('deployment-helpers.mjs" launch-agent'));
   assert.ok(bootout < script.indexOf('/bin/mv "$RUNTIME_STAGING" "$RUNTIME_DIR"'));
   const kickstart = script.indexOf('/bin/launchctl kickstart -k');
   const activationStart = script.indexOf('fs.writeFileSync');
@@ -364,17 +208,6 @@ test("uninstaller preflights requested Serve removal before any deletion", async
   assert.match(script, /\/bin\/mv \"\$RUNTIME_DIR\" \"\$TRASH_HOLDER\/runtime\"/);
 });
 
-test("package helper is directly executable by the npm deployment hook", async () => {
-  const url = new URL("./package-evenhub.mjs", import.meta.url);
-  const [script, metadata] = await Promise.all([readFile(url, "utf8"), stat(url)]);
-  assert.equal(script.startsWith("#!/usr/bin/env node\n"), true);
-  if (process.platform !== "win32") assert.notEqual(metadata.mode & 0o100, 0);
-  assert.doesNotMatch(script, /VITE_DEFAULT_BRIDGE_URL\s*:\s*origins/);
-  for (const name of ["VITE_DEFAULT_BRIDGE_URL", "VITE_BRIDGE_URL", "VITE_BRIDGE_TOKEN"]) {
-    assert.match(script, new RegExp(`delete buildEnvironment\\.${name}`));
-  }
-});
-
 test("connection-info command derives the exact WSS events URL without reading credentials", async () => {
   const scriptUrl = new URL("./show-connection-info.sh", import.meta.url);
   const script = await readFile(scriptUrl, "utf8");
@@ -389,14 +222,12 @@ test("connection-info command derives the exact WSS events URL without reading c
 });
 
 test("connection-info is exposed from the repository root and installer points back to it", async () => {
-  const [packageJson, installer, companionUi] = await Promise.all([
+  const [packageJson, installer] = await Promise.all([
     readFile(new URL("../package.json", import.meta.url), "utf8").then(JSON.parse),
     readFile(new URL("./install.sh", import.meta.url), "utf8"),
-    readFile(new URL("../src/companion-ui.ts", import.meta.url), "utf8"),
   ]);
   assert.equal(packageJson.scripts["connection-info"], "./scripts/show-connection-info.sh");
   assert.match(installer, /repository root[^\n]*npm run connection-info/);
-  assert.match(companionUi, /WebSocket URL provided by your installer agent/);
 });
 
 test("live verifier reads secrets only from private installed files and never prints response data", async () => {
@@ -414,7 +245,6 @@ test("archive launch environment is explicitly paired and never changes authoriz
   const configured = launchAgentPlist({ ...base, archiveProjectId: "assistant-project", archiveWorkspaceRoot: "/Users/test/Digital Assistant" });
   assert.match(configured, /BRIDGE_ARCHIVE_PROJECT_ID=assistant-project/);
   assert.match(configured, /BRIDGE_ARCHIVE_WORKSPACE_ROOT=\/Users\/test\/Digital Assistant/);
-  assert.match(configured, /BRIDGE_ALLOW_NO_ORIGIN=false/);
   assert.doesNotMatch(configured, /BRIDGE_TOKEN|T3_ACCESS_TOKEN|BRIDGE_RUNTIME_MODE/);
   for (const invalid of [{ archiveProjectId: "id" }, { archiveWorkspaceRoot: "/tmp/assistant" }, { archiveProjectId: "bad\nid", archiveWorkspaceRoot: "/tmp/assistant" }, { archiveProjectId: "id", archiveWorkspaceRoot: "relative" }, { archiveProjectId: "id", archiveWorkspaceRoot: "/tmp/../etc" }]) assert.throws(() => launchAgentPlist({ ...base, ...invalid }), /Archive setup/);
 });

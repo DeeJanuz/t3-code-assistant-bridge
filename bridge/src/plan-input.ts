@@ -63,7 +63,7 @@ function questions(value: unknown): PlanQuestion[] | null {
 
 /** Only the provider's structured user-input lifecycle is actionable, never approvals. */
 export function normalizePendingPlanInput(thread: T3Thread): PendingPlanInput | null {
-  if (thread.interactionMode !== "plan" || thread.archivedAt !== null ||
+  if (!["default", "plan"].includes(thread.interactionMode) || thread.archivedAt !== null ||
       thread.hasPendingUserInput === false || thread.latestTurn?.state !== "running" ||
       !thread.session || !["running", "ready"].includes(thread.session.status) ||
       (thread.session.activeTurnId != null && thread.session.activeTurnId !== thread.latestTurn.turnId) ||
@@ -95,6 +95,36 @@ export function normalizePendingPlanInput(thread: T3Thread): PendingPlanInput | 
     pending.set(requestId, { ...content, revision: digest(content) });
   }
   return [...pending.values()].at(-1) ?? null;
+}
+
+const MAX_PENDING_QUESTION_LOOKUPS = 8;
+const MAX_PENDING_QUESTION_CHARS = 280;
+
+/**
+ * Give blocked sessions the first pending question so glasses alerts can lead
+ * with it. The shell has no question text, so this reads each thread. Lookups
+ * are bounded and best effort; a failure leaves the session without a preview.
+ */
+export async function attachPendingQuestions<T extends {
+  id: string; projectId: string; environmentId?: string; hasPendingUserInput?: boolean; pendingQuestion?: string;
+}>(sessions: readonly T[], clientFor: (environmentId?: string) => Pick<T3Client, "thread"> | undefined): Promise<void> {
+  await Promise.all(sessions.filter((session) => session.hasPendingUserInput === true)
+    .slice(0, MAX_PENDING_QUESTION_LOOKUPS).map(async (session) => {
+      const client = clientFor(session.environmentId);
+      if (!client) return;
+      try {
+        const snapshot = await client.thread(session.id);
+        if (snapshot.thread.id !== session.id || snapshot.thread.projectId !== session.projectId) return;
+        const pending = normalizePendingPlanInput(snapshot.thread);
+        const first = pending?.questions[0];
+        if (!pending || !first) return;
+        const flat = first.question.replace(/\s+/gu, " ").trim();
+        const more = pending.questions.length - 1;
+        const suffix = more > 0 ? ` (+${more} more)` : "";
+        const limit = MAX_PENDING_QUESTION_CHARS - suffix.length;
+        session.pendingQuestion = (flat.length <= limit ? flat : `${flat.slice(0, limit - 3).trimEnd()}...`) + suffix;
+      } catch { /* The alert falls back to the session title. */ }
+    }));
 }
 
 function unavailable(): ApiError {
@@ -160,7 +190,7 @@ export class PlanInputService {
       throw new ApiError(502, "upstream_invalid_response", "T3 Code returned an invalid response");
     }
     const pending = normalizePendingPlanInput(snapshot.thread);
-    if (!pending || pending.requestId !== requestId || pending.revision !== params.revision || allowed.interactionMode !== "plan") throw unavailable();
+    if (!pending || pending.requestId !== requestId || pending.revision !== params.revision || !["default", "plan"].includes(allowed.interactionMode)) throw unavailable();
     const answers = validatePlanAnswers(params.answers, pending, this.config.maxTextChars);
     const key = digest([threadId, requestId]);
     const fingerprint = digest([pending.revision, answers]);

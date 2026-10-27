@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, realpath } from "node:fs/promises";
+import { access, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,12 +9,10 @@ import { promisify } from "node:util";
 import { dataDirectory, loopbackT3Url, cleanPath, resolveT3Entry } from "../../scripts/portable-deployment.mjs";
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_APP_PATHS = [
-  "/Applications/T3 Code.app",
-  "/Applications/T3 Code (Alpha).app",
-  path.join(homedir(), "Applications", "T3 Code.app"),
-  path.join(homedir(), "Applications", "T3 Code (Alpha).app"),
-];
+const DEFAULT_APP_PATHS = ["T3 Code", "T3 Code (Alpha)", "T3 Code (Nightly)"].flatMap((name) => [
+  `/Applications/${name}.app`,
+  path.join(homedir(), "Applications", `${name}.app`),
+]);
 const label = `even-t3-bridge-${randomUUID()}`;
 const DEFAULT_MODEL_PATH = path.join(
   dataDirectory(),
@@ -35,34 +33,82 @@ function environmentWithoutBridgeSecrets(extra = {}) {
   return env;
 }
 
-export async function findApp() {
+/**
+ * The CLI of the runtime T3's boot service runs. T3 self-updates into
+ * `runtime/versions/<version>`, so pinned CLI paths go stale, and an older
+ * CLI issues pairing credentials the newer server rejects.
+ */
+export async function activeRuntimeCli(baseDir, serverVersion = null) {
+  try {
+    const state = JSON.parse(await readFile(path.join(baseDir, "runtime", "service-state.json"), "utf8"));
+    const version = state?.activeVersion;
+    if (typeof version !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(version)) return null;
+    // A desktop app can serve while an older CLI runtime's state remains.
+    if (serverVersion !== null && version !== serverVersion) return null;
+    const executable = path.join(baseDir, "runtime", "versions", version, process.platform === "win32" ? "t3.exe" : "t3");
+    await access(executable, constants.X_OK);
+    return { executable: await realpath(executable), entry: null };
+  } catch {
+    return null;
+  }
+}
+
+/** The running server's version, used to pick the matching app bundle. Best effort. */
+export async function runningServerVersion(baseUrl) {
+  try {
+    const response = await fetch(new URL("/.well-known/t3/environment", baseUrl), {
+      redirect: "error", signal: AbortSignal.timeout(5000),
+    });
+    const raw = await response.text();
+    if (!response.ok || raw.length > 65_536) return null;
+    const version = JSON.parse(raw)?.serverVersion;
+    return typeof version === "string" && version.length <= 64 ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+async function plistValue(plist, key) {
+  const metadata = await execFileAsync("/usr/bin/plutil", ["-extract", key, "raw", "-o", "-", plist], {
+    env: environmentWithoutBridgeSecrets(), encoding: "utf8", timeout: 5000, maxBuffer: 4096,
+  });
+  return metadata.stdout.trim();
+}
+
+export async function findApp({ baseDir, serverVersion = null } = {}) {
+  const active = baseDir ? await activeRuntimeCli(baseDir, serverVersion) : null;
+  if (active) return active;
   if (process.env.T3_CLI_EXECUTABLE || process.env.T3_CLI_ENTRY) {
     const executable = cleanPath(process.env.T3_CLI_EXECUTABLE);
-    const entry = cleanPath(process.env.T3_CLI_ENTRY);
     await access(executable, constants.X_OK);
-    return { executable: await realpath(executable), entry: await resolveT3Entry(entry) };
+    // The native t3 CLI is a single executable with no separate server entry.
+    const entry = process.env.T3_CLI_ENTRY ? await resolveT3Entry(cleanPath(process.env.T3_CLI_ENTRY)) : null;
+    return { executable: await realpath(executable), entry };
   }
-  if (process.platform !== "darwin") throw new Error("Set T3_CLI_EXECUTABLE and T3_CLI_ENTRY to your installed T3 Code executable and server bin.mjs.");
+  if (process.platform !== "darwin") throw new Error("Set T3_CLI_EXECUTABLE to your installed T3 Code executable, plus T3_CLI_ENTRY for an Electron or Node server bin.mjs.");
   const candidates = process.env.T3_APP_PATH
     ? [path.resolve(process.env.T3_APP_PATH)]
     : DEFAULT_APP_PATHS;
+  const found = [];
   for (const candidate of candidates) {
     try {
       const resolved = await realpath(candidate);
-      const metadata = await execFileAsync("/usr/bin/plutil", [
-        "-extract", "CFBundleExecutable", "raw", "-o", "-", path.join(resolved, "Contents", "Info.plist"),
-      ], { env: environmentWithoutBridgeSecrets(), encoding: "utf8", timeout: 5000, maxBuffer: 4096 });
-      const executableName = metadata.stdout.trim();
+      const plist = path.join(resolved, "Contents", "Info.plist");
+      const executableName = await plistValue(plist, "CFBundleExecutable");
       if (!executableName || executableName === "." || executableName === ".." || /[\\/\u0000-\u001f\u007f]/.test(executableName)) continue;
       const executable = path.join(resolved, "Contents", "MacOS", executableName);
       const archive = path.join(resolved, "Contents", "Resources", "app.asar");
       const entry = path.join(archive, "apps", "server", "dist", "bin.mjs");
       await Promise.all([access(executable, constants.X_OK), access(archive)]);
-      return { executable, entry };
+      const version = await plistValue(plist, "CFBundleShortVersionString").catch(() => null);
+      found.push({ executable, entry, version });
     } catch {
       // Try the next fixed installation location.
     }
   }
+  // Several channels can be installed; only the running server's CLI mints valid credentials.
+  const chosen = found.find((app) => serverVersion !== null && app.version === serverVersion) ?? found[0];
+  if (chosen) return { executable: chosen.executable, entry: chosen.entry };
   throw new Error("T3 Code was not found. Set T3_APP_PATH to the installed .app bundle.");
 }
 
@@ -165,9 +211,9 @@ async function stopManagedWhisper(child) {
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
 }
 
-async function runT3(cli, args) {
+export async function runT3(cli, args) {
   try {
-    return await execFileAsync(cli.executable, [cli.entry, ...args], {
+    return await execFileAsync(cli.executable, cli.entry ? [cli.entry, ...args] : args, {
       env: environmentWithoutBridgeSecrets({ ELECTRON_RUN_AS_NODE: "1" }),
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
@@ -277,9 +323,20 @@ export async function main() {
   }
   const { loadConfig } = await import("../dist/src/config.js");
   const { startBridgeRuntime } = await import("../dist/src/runtime.js");
+  if (process.platform === 'darwin' && !process.env.BRIDGE_PEER_DIRECTORY) {
+    const directory = path.join(dataDirectory(), 'peers');
+    try {
+      const { readPeerFile } = await import('../dist/src/peer-store.js');
+      const settings = JSON.parse(await readPeerFile(path.join(directory, 'settings.json')));
+      if (settings.enabled === true) process.env.BRIDGE_PEER_DIRECTORY = directory;
+    } catch (error) {
+      if (error.code !== 'ENOENT') process.stderr.write('Peer settings unavailable; starting local T3 only.\n');
+    }
+  }
   const config = loadConfig();
   const baseUrl = new URL(loopbackT3Url(config.t3BaseUrl.href));
-  const baseDir = path.resolve(process.env.T3_BASE_DIR || path.join(homedir(), ".t3"));
+  const requestedBaseDir = path.resolve(process.env.T3_BASE_DIR || path.join(homedir(), ".t3"));
+  const baseDir = await realpath(requestedBaseDir).catch(() => requestedBaseDir);
   // Bind the phone/dashboard server before looking for either optional provider.
   // Secrets remain in this process and are never put in a child bridge environment.
   const runtime = startBridgeRuntime(config);
@@ -300,29 +357,34 @@ export async function main() {
   };
   const revoke = async (owned) => {
     if (!owned) return;
-    await runT3(owned.cli, ["auth", "session", "revoke", "--base-dir", baseDir, owned.sessionId]).catch(
+    // T3 may have updated since minting; revoke with the current CLI.
+    const cli = await findApp({ baseDir, serverVersion: await runningServerVersion(baseUrl) }).catch(() => owned.cli);
+    await runT3(cli, ["auth", "session", "revoke", "--base-dir", baseDir, owned.sessionId]).catch(
       () => process.stderr.write("Warning: temporary T3 session revocation failed. Revoke it in T3 Code.\n"),
     );
   };
   async function refreshT3() {
-    try {
+    const localAttempt = (async () => {
       if (session === null) {
-        const cli = await findApp();
+        const cli = await findApp({ baseDir, serverVersion: await runningServerVersion(baseUrl) });
         const minted = await mintScopedToken(cli, baseDir, baseUrl);
         session = { ...minted, cli };
       }
-      if (stopping) return;
+      if (stopping) return false;
       await runtime.useT3Token(session.accessToken);
-      if (!stopping) status("T3", true);
-    } catch (error) {
+      return true;
+    })();
+    const [local] = await Promise.allSettled([localAttempt]);
+    if (local.status === "rejected") {
       runtime.clearT3();
-      if (error?.code === "upstream_auth_failed" && session !== null) {
+      if (local.reason?.code === "upstream_auth_failed" && session !== null) {
         const expired = session; session = null;
         await revoke(expired);
       }
-      if (!stopping) status("T3", false);
-    } finally {
-      if (!stopping) t3Timer = setTimeout(() => { t3Work = refreshT3(); }, 10_000);
+    }
+    if (!stopping) {
+      status("T3", local.status === "fulfilled" && local.value);
+      t3Timer = setTimeout(() => { t3Work = refreshT3(); }, 10_000);
     }
   }
   function retryWhisper() {

@@ -1,4 +1,4 @@
 interface:
-  display_name: "T3 Code Assistant Deploy"
-  short_description: "Install T3 Code Assistant for Even G2"
-  default_prompt: "Use $t3-bridge-deploy to install and package the T3 Code Assistant for my Even G2."
+  display_name: "Faceclaw T3 Bridge Deploy"
+  short_description: "Install the Faceclaw T3 Bridge"
+  default_prompt: "Use $t3-bridge-deploy to install the Faceclaw T3 Bridge on this computer and give me the T3 app setup details."

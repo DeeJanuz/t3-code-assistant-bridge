@@ -1,17 +1,23 @@
-import { PhoneService, type PhoneSnapshot } from "./phone.js";
+import { SignalHttp } from './signal-http.js';
+import { FaceclawRelay, faceclawToken, mintToolToken, verifyToolToken } from './faceclaw.js';
+import { RefinementService } from './refinement.js';
+import { FaceclawProviderGrants } from './faceclaw-provider.js';
 import { AssistantArchive, type ArchiveStatus } from "./assistant-archive.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
-import { diagnosticOrigin } from "./pairing-diagnostics.js";
 import { WeatherService } from "./weather.js";
-import { PlanInputService } from "./plan-input.js";
+import { SessionControlsService, freshAllowedThread, requireIdleSession } from "./session-controls.js";
+import { PlanInputService, attachPendingQuestions } from "./plan-input.js";
 import { BridgeServiceRegistry } from "./service-registry.js";
+import { PeerService, type PeerClientFactory } from "./peer-service.js";
+import { ManagedEnvironmentRouter, asEnvironmentRouter, isEnvironmentRouter, PrimaryEnvironmentClient } from "./environment-router.js";
 import {
   findProject,
   findThread,
   normalizeProjects,
   normalizeSessions,
+  sessionBackground,
   normalizeTranscript,
 } from "./normalize.js";
 import {
@@ -20,7 +26,6 @@ import {
   applySecurityHeaders,
   bearerToken,
   isSafeId,
-  originAllowed,
   parsePathId,
   parseText,
   pairingPassphraseMatches,
@@ -32,7 +37,9 @@ import {
 } from "./security.js";
 import type {
   BridgeConfig,
+  BridgeEnvironment,
   T3Client,
+  T3EnvironmentRouter,
   T3ModelCatalog,
   T3NewSessionSelection,
   T3ThreadShell,
@@ -41,7 +48,6 @@ import type {
 
 const WS_PROTOCOL = "even-t3-v1";
 const MAX_WS_FRAME_BYTES = 64 * 1024;
-const MAX_WS_JSON_BYTES = 16 * 1024;
 const MAX_WS_SUBSCRIPTIONS = 8;
 const MAX_WS_BUFFERED_BYTES = 1024 * 1024;
 const MIN_VOICE_BYTES = 3200;
@@ -50,7 +56,6 @@ const PAIRING_ATTEMPTS_PER_WINDOW = 5;
 const PAIRING_WINDOW_MS = 5 * 60_000;
 
 interface VoiceRecording {
-  readonly phoneKey: string | null;
   phase: "recording" | "finishing";
   readonly chunks: Buffer[];
   bytes: number;
@@ -62,12 +67,126 @@ interface VoiceRecording {
 }
 
 interface SocketState {
+  refinement: AbortController | null;
   readonly socket: WebSocket;
   readonly subscriptions: Set<string>;
-  shellSequence: number | null;
+  readonly shellSequences: Map<string, number>;
   readonly threadSequences: Map<string, number>;
+  environmentFingerprint: string;
+  backgroundFingerprint: string;
   alive: boolean;
   voice: VoiceRecording | null;
+}
+
+function environmentResourceKey(environmentId: string, resourceId: string): string {
+  return JSON.stringify([environmentId, resourceId]);
+}
+
+function parseEnvironmentResourceKey(key: string): { environmentId: string; resourceId: string } {
+  const value: unknown = JSON.parse(key);
+  if (!Array.isArray(value) || value.length !== 2 || !value.every((part) => typeof part === "string")) {
+    throw new Error("Invalid environment resource key");
+  }
+  return { environmentId: value[0]!, resourceId: value[1]! };
+}
+
+function requestedEnvironmentId(params: Record<string, unknown>): string | undefined {
+  if (params.environmentId === undefined) return undefined;
+  return requiredId(params, "environmentId");
+}
+
+function environmentParams(params: Record<string, unknown>): Record<string, unknown> {
+  if (params.environmentId === undefined) return params;
+  const { environmentId: _, ...rest } = params;
+  return rest;
+}
+
+function withEnvironment<T extends Record<string, unknown>>(value: T, environment: BridgeEnvironment): T & { environmentId: string } {
+  return { ...value, environmentId: environment.environmentId };
+}
+
+function aggregateSnapshotId(values: readonly { environmentId: string; sequence: number }[]): string {
+  return createHash("sha256").update(JSON.stringify([...values].sort((left, right) =>
+    left.environmentId.localeCompare(right.environmentId)))).digest("base64url");
+}
+
+function latestTimestamp(values: readonly string[]): string {
+  return values.filter((value) => Number.isFinite(Date.parse(value))).sort().at(-1) ?? new Date(0).toISOString();
+}
+
+type RouterSnapshots = Awaited<ReturnType<T3EnvironmentRouter["snapshots"]>>;
+
+function aggregateSessionsFromSnapshots(snapshot: RouterSnapshots, config: BridgeConfig) {
+  const results = snapshot.available.map(({ environment, shell }) => normalizeSessions(shell, config, environment));
+  const byActivity = <T extends { lastActivityAt: string; environmentId?: string; id: string }>(left: T, right: T) =>
+    Date.parse(right.lastActivityAt) - Date.parse(left.lastActivityAt) ||
+    (left.environmentId ?? "").localeCompare(right.environmentId ?? "") || left.id.localeCompare(right.id);
+  return {
+    snapshotId: aggregateSnapshotId(snapshot.available.map(({ environment, shell }) => ({
+      environmentId: environment.environmentId, sequence: shell.snapshotSequence,
+    }))),
+    frozenAt: latestTimestamp(snapshot.available.map(({ shell }) => shell.updatedAt)),
+    environments: snapshot.environments,
+    partial: snapshot.environments.some((environment) => environment.status !== "connected"),
+    unsettled: results.flatMap((result) => result.unsettled).sort(byActivity),
+    settled: results.flatMap((result) => result.settled).sort(byActivity),
+  };
+}
+
+async function aggregateSessions(router: T3EnvironmentRouter, config: BridgeConfig) {
+  const snapshot = await router.snapshots();
+  const result = aggregateSessionsFromSnapshots(snapshot, config);
+  const clients = new Map(snapshot.available.map(({ environment, client }) => [environment.environmentId, client] as const));
+  await attachPendingQuestions(result.unsettled, (environmentId) => environmentId === undefined ? undefined : clients.get(environmentId));
+  return result;
+}
+
+/**
+ * T3 keeps background liveness in memory, so a subagent or Monitor loop can
+ * finish without a new shell sequence. Track it separately for change events.
+ */
+function backgroundFingerprint(snapshot: RouterSnapshots): string {
+  return JSON.stringify(snapshot.available.map(({ environment, shell }) => [environment.environmentId,
+    shell.threads.flatMap((thread) => {
+      const background = sessionBackground(thread);
+      return background === null ? [] : [[thread.id, background]];
+    })]));
+}
+
+function aggregateProjectsFromSnapshots(snapshot: RouterSnapshots, config: BridgeConfig) {
+  return {
+    snapshotId: aggregateSnapshotId(snapshot.available.map(({ environment, shell }) => ({
+      environmentId: environment.environmentId, sequence: shell.snapshotSequence,
+    }))),
+    environments: snapshot.environments,
+    partial: snapshot.environments.some((environment) => environment.status !== "connected"),
+    projects: snapshot.available.flatMap(({ environment, shell }) => normalizeProjects(shell, config, environment)),
+  };
+}
+
+async function aggregateProjects(router: T3EnvironmentRouter, config: BridgeConfig) {
+  return aggregateProjectsFromSnapshots(await router.snapshots(), config);
+}
+
+async function modelsForEnvironment(client: T3Client, environment: BridgeEnvironment) {
+  const result = flattenModelCatalog(await client.modelCatalog());
+  return {
+    environmentId: environment.environmentId,
+    models: result.models.map((model) => ({ ...model, environmentId: environment.environmentId,
+      environmentLabel: environment.label })),
+  };
+}
+
+async function aggregateModels(router: T3EnvironmentRouter) {
+  const environments = await router.list();
+  const connected = environments.filter((environment) => environment.status === "connected");
+  const results = await Promise.all(connected.map(async (environment) => {
+    try { return await modelsForEnvironment((await router.resolve(environment.environmentId)).client, environment); }
+    catch { return null; }
+  }));
+  return { environments, partial: environments.some((environment) => environment.status !== "connected") ||
+      results.some((result) => result === null),
+    models: results.flatMap((result) => result?.models ?? []) };
 }
 
 interface RpcRequest {
@@ -323,16 +442,20 @@ class EventHub {
   private polling = false;
 
   constructor(
-    private readonly client: T3Client,
+    private readonly router: T3EnvironmentRouter,
     private readonly config: BridgeConfig,
+    private readonly aggregateMode: boolean,
   ) {}
 
   add(socket: WebSocket): SocketState {
     const state: SocketState = {
+      refinement: null,
       socket,
       subscriptions: new Set(),
-      shellSequence: null,
+      shellSequences: new Map(),
       threadSequences: new Map(),
+      environmentFingerprint: "",
+      backgroundFingerprint: "",
       alive: true,
       voice: null,
     };
@@ -341,20 +464,10 @@ class EventHub {
       this.timer = setInterval(() => void this.poll(), this.config.pollIntervalMs);
       this.timer.unref();
     }
-    sendEvent(state, "bridge.status", { status: "connected", protocol: WS_PROTOCOL });
+    void this.router.list().then((environments) => sendEvent(state, "bridge.status", {
+      status: "connected", protocol: WS_PROTOCOL, environments,
+    }), () => sendEvent(state, "bridge.status", { status: "upstream-unavailable", protocol: WS_PROTOCOL }));
     return state;
-  }
-
-  phoneChanged(snapshot: PhoneSnapshot): void {
-    for (const state of this.states) {
-      const recording = state.voice;
-      if (recording?.phoneKey && (!snapshot.connected || !snapshot.notifications.some(item => item.key === recording.phoneKey))) {
-        recording.abortController.abort();
-        wipeRecording(recording);
-        state.voice = null;
-      }
-      sendEvent(state, "phone.changed", snapshot);
-    }
   }
 
   archiveStatus(status: ArchiveStatus): void {
@@ -362,6 +475,7 @@ class EventHub {
   }
 
   remove(state: SocketState): void {
+    state.refinement?.abort();
     if (state.voice !== null) {
       state.voice.abortController.abort();
       wipeRecording(state.voice);
@@ -385,61 +499,91 @@ class EventHub {
     }
   }
 
-  async subscribe(state: SocketState, threadId: string): Promise<void> {
-    if (state.subscriptions.size >= MAX_WS_SUBSCRIPTIONS && !state.subscriptions.has(threadId)) {
+  async subscribe(state: SocketState, threadId: string, environmentId?: string): Promise<BridgeEnvironment> {
+    const resolved = await this.router.resolve(environmentId);
+    const key = environmentResourceKey(resolved.environment.environmentId, threadId);
+    if (state.subscriptions.size >= MAX_WS_SUBSCRIPTIONS && !state.subscriptions.has(key)) {
       throw new ApiError(400, "subscription_limit", "Too many session subscriptions");
     }
-    const shell = await this.client.shell();
+    const shell = await resolved.client.shell();
     findThread(shell, threadId, this.config);
-    const snapshot = await this.client.thread(threadId);
+    const snapshot = await resolved.client.thread(threadId);
     if (snapshot.thread.id !== threadId) {
       throw new ApiError(502, "upstream_invalid_response", "T3 Code returned an invalid response");
     }
-    state.subscriptions.add(threadId);
-    state.threadSequences.set(threadId, snapshot.snapshotSequence);
+    state.subscriptions.add(key);
+    state.threadSequences.set(key, snapshot.snapshotSequence);
+    return resolved.environment;
+  }
+
+  async unsubscribe(state: SocketState, threadId: string, environmentId?: string): Promise<BridgeEnvironment> {
+    const resolved = await this.router.resolve(environmentId);
+    const key = environmentResourceKey(resolved.environment.environmentId, threadId);
+    state.subscriptions.delete(key);
+    state.threadSequences.delete(key);
+    return resolved.environment;
   }
 
   private async poll(): Promise<void> {
     if (this.polling || this.states.size === 0) return;
     this.polling = true;
     try {
-      const shell = await this.client.shell();
+      const snapshot = await this.router.snapshots();
+      const available = new Map(snapshot.available.map((item) => [item.environment.environmentId, item] as const));
+      const background = backgroundFingerprint(snapshot);
       for (const state of this.states) {
-        if (state.shellSequence !== shell.snapshotSequence) {
-          state.shellSequence = shell.snapshotSequence;
-          sendEvent(state, "sessions.changed", normalizeSessions(shell, this.config));
+        const environmentFingerprint = JSON.stringify(snapshot.environments);
+        const changed = state.environmentFingerprint !== environmentFingerprint ||
+          state.backgroundFingerprint !== background || snapshot.available.some(({ environment, shell }) =>
+          state.shellSequences.get(environment.environmentId) !== shell.snapshotSequence) ||
+          [...state.shellSequences].some(([environmentId]) => !available.has(environmentId));
+        if (changed) {
+          state.environmentFingerprint = environmentFingerprint;
+          state.backgroundFingerprint = background;
+          state.shellSequences.clear();
+          for (const { environment, shell } of snapshot.available) {
+            state.shellSequences.set(environment.environmentId, shell.snapshotSequence);
+          }
+          sendEvent(state, "sessions.changed", this.aggregateMode
+            ? aggregateSessionsFromSnapshots(snapshot, this.config)
+            : normalizeSessions(snapshot.available[0]!.shell, this.config));
         }
       }
-      const threadIds = new Set<string>();
+      const subscriptions = new Set<string>();
       for (const state of this.states) {
-        for (const threadId of state.subscriptions) threadIds.add(threadId);
+        for (const key of state.subscriptions) subscriptions.add(key);
       }
       await Promise.all(
-        [...threadIds].map(async (threadId) => {
+        [...subscriptions].map(async (key) => {
+          const { environmentId, resourceId: threadId } = parseEnvironmentResourceKey(key);
           try {
-            findThread(shell, threadId, this.config);
-            const snapshot = await this.client.thread(threadId);
+            const environment = available.get(environmentId);
+            if (!environment) throw new Error("Environment unavailable");
+            findThread(environment.shell, threadId, this.config);
+            const threadSnapshot = await environment.client.thread(threadId);
             for (const state of this.states) {
               if (
-                state.subscriptions.has(threadId) &&
-                state.threadSequences.get(threadId) !== snapshot.snapshotSequence
+                state.subscriptions.has(key) &&
+                state.threadSequences.get(key) !== threadSnapshot.snapshotSequence
               ) {
-                state.threadSequences.set(threadId, snapshot.snapshotSequence);
+                state.threadSequences.set(key, threadSnapshot.snapshotSequence);
                 sendEvent(
                   state,
                   "transcript.changed",
                   {
+                    ...(this.aggregateMode ? { environmentId } : {}),
                     threadId,
-                    snapshotId: String(snapshot.snapshotSequence),
+                    snapshotId: String(threadSnapshot.snapshotSequence),
                   },
                 );
               }
             }
           } catch {
             for (const state of this.states) {
-              if (state.subscriptions.delete(threadId)) {
-                state.threadSequences.delete(threadId);
+              if (state.subscriptions.delete(key)) {
+                state.threadSequences.delete(key);
                 sendEvent(state, "subscription.error", {
+                  ...(this.aggregateMode ? { environmentId } : {}),
                   threadId,
                   error: { code: "session_unavailable", message: "Session is unavailable" },
                 });
@@ -449,9 +593,10 @@ class EventHub {
         }),
       );
     } catch {
-      for (const state of this.states) {
-        sendEvent(state, "bridge.status", { status: "upstream-unavailable" });
-      }
+      const environments = await this.router.list().catch(() => []);
+      for (const state of this.states) sendEvent(state, "bridge.status", {
+        status: "upstream-unavailable", ...(this.aggregateMode ? { environments } : {}),
+      });
     } finally {
       this.polling = false;
     }
@@ -485,13 +630,11 @@ async function sendTurn(
   config: BridgeConfig,
   threadId: string,
   text: string,
+  controls: { interactionMode?: "default" | "plan"; reasoningId?: string } = {},
 ) {
-  const shell = await client.shell();
-  const thread = findThread(shell, threadId, config);
-  if (thread.session?.status === "running" || thread.session?.status === "starting") {
-    throw new ApiError(409, "session_busy", "Wait for the current turn to finish");
-  }
-  const result = await client.sendMessage({ thread, text });
+  const thread = await freshAllowedThread(client, config, threadId);
+  requireIdleSession(thread);
+  const result = await client.sendMessage({ thread, text, ...controls });
   return { threadId, text, sequence: result.sequence };
 }
 
@@ -507,6 +650,23 @@ async function steerTurn(
     throw new ApiError(409, "session_not_running", "The session is no longer running");
   }
   const result = await client.steerMessage({ thread, text });
+  return { threadId, text, sequence: result.sequence };
+}
+
+async function replyTurn(
+  client: T3Client,
+  config: BridgeConfig,
+  threadId: string,
+  text: string,
+) {
+  const thread = await freshAllowedThread(client, config, threadId);
+  const status = thread.session?.status ?? "idle";
+  const active = ["running", "starting"].includes(status) ||
+    thread.session?.activeTurnId != null || thread.latestTurn?.state === "running";
+  const idle = ["idle", "ready", "interrupted", "stopped", "error"].includes(status) &&
+    thread.session?.activeTurnId == null && thread.latestTurn?.state !== "running";
+  if (!active && !idle) throw new ApiError(502, "upstream_invalid_response", "T3 Code returned an invalid session state");
+  const result = await client.replyMessage({ thread, text });
   return { threadId, text, sequence: result.sequence };
 }
 
@@ -528,32 +688,43 @@ async function routeRpc(
   request: RpcRequest,
   state: SocketState,
   config: BridgeConfig,
-  client: T3Client,
+  router: T3EnvironmentRouter,
+  aggregateMode: boolean,
   transcriber: Transcriber,
   events: EventHub,
   services: BridgeServiceRegistry,
-  phone: PhoneService,
+  environmentServices: (environmentId: string, client: T3Client) => {
+    readonly plan: PlanInputService;
+    readonly controls: SessionControlsService;
+  },
 ): Promise<unknown> {
   switch (request.method) {
-    case "phone.pairing.create": return phone.createPairing();
-    case "phone.apps.list":
-    case "phone.notifications.list": return phone.snapshot();
-    case "phone.apps.setEnabled": return phone.setEnabled(request.params);
-    case "phone.notifications.reply": return phone.command("reply", request.params);
-    case "phone.notifications.dismiss": return phone.command("dismiss", request.params);
-    case "sessions.list":
-      return normalizeSessions(await client.shell(), config);
+    case "environments.list":
+      return { environments: await router.list() };
+    case "sessions.list": {
+      if (aggregateMode) return aggregateSessions(router, config);
+      const { client } = await router.primary();
+      const result = normalizeSessions(await client.shell(), config);
+      await attachPendingQuestions(result.unsettled, () => client);
+      return result;
+    }
     case "projects.list": {
-      const snapshot = await client.shell();
+      if (aggregateMode) return aggregateProjects(router, config);
+      const snapshot = await (await router.primary()).client.shell();
       return {
         snapshotId: String(snapshot.snapshotSequence),
         projects: normalizeProjects(snapshot, config),
       };
     }
     case "models.list": {
-      return flattenModelCatalog(await client.modelCatalog());
+      if (aggregateMode && request.params.environmentId === undefined) return aggregateModels(router);
+      const resolved = await router.resolve(requestedEnvironmentId(request.params));
+      return aggregateMode ? modelsForEnvironment(resolved.client, resolved.environment)
+        : flattenModelCatalog(await resolved.client.modelCatalog());
     }
     case "transcript.get": {
+      const resolved = await router.resolve(requestedEnvironmentId(request.params));
+      const client = resolved.client;
       const threadId = requiredId(request.params, "threadId");
       const shell = await client.shell();
       const allowed = findThread(shell, threadId, config);
@@ -562,36 +733,49 @@ async function routeRpc(
       if (snapshot.thread.id !== threadId || snapshot.thread.projectId !== allowed.projectId) {
         throw new ApiError(502, "upstream_invalid_response", "T3 Code returned an invalid response");
       }
-      await events.subscribe(state, threadId);
+      await events.subscribe(state, threadId, resolved.environment.environmentId);
       const projectTitle =
         shell.projects.find((project) => project.id === snapshot.thread.projectId)?.title ??
         "Unknown project";
-      return normalizeTranscript(snapshot, projectTitle);
+      return normalizeTranscript(snapshot, projectTitle, aggregateMode ? resolved.environment : undefined);
+    }
+    case "transcript.unsubscribe": {
+      const threadId = requiredId(request.params, "threadId");
+      if (Object.keys(request.params).some((key) => !["threadId", "environmentId"].includes(key))) {
+        throw new ApiError(400, "invalid_request", "Unsubscribe accepts only threadId and environmentId");
+      }
+      const environment = await events.unsubscribe(state, threadId, requestedEnvironmentId(request.params));
+      const result = { threadId, unsubscribed: true as const };
+      return aggregateMode ? withEnvironment(result, environment) : result;
     }
     case "assistant.start":
     case "thread.start": {
       // Keep assistant requests strict; new-session permissions are selected
       // by the server, never supplied by the client.
       if (request.method === "assistant.start" && Object.keys(request.params).some(
-        (key) => !["projectId", "modelSelection", "text"].includes(key),
+        (key) => !["environmentId", "projectId", "modelSelection", "text"].includes(key),
       )) {
         throw new ApiError(400, "invalid_request", "Assistant creation accepts only projectId, modelSelection, and text");
       }
       const projectId = requiredId(request.params, "projectId");
       const selection = parseModelSelection(request.params);
-      return startThread(
-        client,
+      const resolved = await router.resolve(requestedEnvironmentId(request.params));
+      const result = await startThread(
+        resolved.client,
         config,
         projectId,
         parseText(request.params, config.maxTextChars),
         selection,
       );
+      return aggregateMode ? withEnvironment(result, resolved.environment) : result;
     }
     case "thread.settle": {
       const threadId = requiredId(request.params, "threadId");
-      if (Object.keys(request.params).some((key) => key !== "threadId")) {
-        throw new ApiError(400, "invalid_request", "Settlement accepts only threadId");
+      if (Object.keys(request.params).some((key) => !["threadId", "environmentId"].includes(key))) {
+        throw new ApiError(400, "invalid_request", "Settlement accepts only threadId and environmentId");
       }
+      const resolved = await router.resolve(requestedEnvironmentId(request.params));
+      const client = resolved.client;
       const shell = await client.shell();
       const allowed = findThread(shell, threadId, config);
       findProject(shell, allowed.projectId, config);
@@ -608,33 +792,59 @@ async function routeRpc(
       }
       requireSettleableThread(snapshot.thread);
       const result = await client.settleThread(threadId);
-      return { threadId, settled: true, sequence: result.sequence };
+      const response = { threadId, settled: true as const, sequence: result.sequence };
+      return aggregateMode ? withEnvironment(response, resolved.environment) : response;
+    }
+    case "thread.model.set":
+    case "thread.reasoning.set":
+    case "plan.submit":
+    case "plan.approve": {
+      const resolved = await router.resolve(requestedEnvironmentId(request.params));
+      const scoped = environmentParams(request.params);
+      const environment = environmentServices(resolved.environment.environmentId, resolved.client);
+      const result = request.method === "thread.model.set" ? await environment.controls.setModel(scoped)
+        : request.method === "thread.reasoning.set" ? await environment.controls.setReasoning(scoped)
+        : request.method === "plan.approve" ? await environment.controls.approve(scoped)
+        : await environment.plan.submit(scoped);
+      return aggregateMode ? withEnvironment(result, resolved.environment) : result;
     }
     case "turn.send": {
+      const resolved = await router.resolve(requestedEnvironmentId(request.params));
       const threadId = requiredId(request.params, "threadId");
-      return sendTurn(client, config, threadId, parseText(request.params, config.maxTextChars));
+      if (Object.keys(request.params).some((key) => !["environmentId", "threadId", "text", "interactionMode", "reasoningId"].includes(key)) ||
+          (request.params.interactionMode !== undefined && request.params.interactionMode !== "default" && request.params.interactionMode !== "plan") ||
+          (request.params.reasoningId !== undefined && (typeof request.params.reasoningId !== "string" || !isSafeId(request.params.reasoningId)))) {
+        throw new ApiError(400, "invalid_request", "Invalid turn controls");
+      }
+      const result = await sendTurn(resolved.client, config, threadId, parseText(request.params, config.maxTextChars), {
+        ...(request.params.interactionMode !== undefined ? { interactionMode: request.params.interactionMode } : {}),
+        ...(request.params.reasoningId !== undefined ? { reasoningId: request.params.reasoningId as string } : {}),
+      });
+      return aggregateMode ? withEnvironment(result, resolved.environment) : result;
     }
     case "turn.steer": {
+      if (Object.keys(request.params).some((key) => !["environmentId", "threadId", "text"].includes(key))) {
+        throw new ApiError(400, "invalid_request", "Active turns cannot change mode or reasoning");
+      }
+      const resolved = await router.resolve(requestedEnvironmentId(request.params));
       const threadId = requiredId(request.params, "threadId");
-      return steerTurn(client, config, threadId, parseText(request.params, config.maxTextChars));
+      const result = await steerTurn(resolved.client, config, threadId, parseText(request.params, config.maxTextChars));
+      return aggregateMode ? withEnvironment(result, resolved.environment) : result;
+    }
+    case "turn.reply": {
+      if (Object.keys(request.params).some((key) => !["environmentId", "threadId", "text"].includes(key))) {
+        throw new ApiError(400, "invalid_request", "Invalid reviewed reply");
+      }
+      const resolved = await router.resolve(requestedEnvironmentId(request.params));
+      const threadId = requiredId(request.params, "threadId");
+      const result = await replyTurn(resolved.client, config, threadId, parseText(request.params, config.maxTextChars));
+      return aggregateMode ? withEnvironment(result, resolved.environment) : result;
     }
     case "voice.start": {
-      let phoneKey: string | null = null;
-      if (request.params.source !== undefined) {
-        if (request.params.source !== "phone" || typeof request.params.key !== "string" || request.params.key.length > 256) {
-          throw new ApiError(400, "invalid_request", "Invalid voice source");
-        }
-        const snapshot = phone.snapshot();
-        if (!snapshot.connected || !snapshot.notifications.some(item => item.key === request.params.key)) {
-          throw new ApiError(409, "phone_unavailable", "Phone notification is unavailable");
-        }
-        phoneKey = request.params.key;
-      }
       if (state.voice !== null) {
         throw new ApiError(409, "voice_active", "Dictation is already active");
       }
       state.voice = {
-        phoneKey,
         phase: "recording",
         chunks: [],
         bytes: 0,
@@ -707,76 +917,15 @@ async function routeHttp(
   request: IncomingMessage,
   response: ServerResponse,
   config: BridgeConfig,
-  client: T3Client,
-  pairingLimiter: FixedWindowRateLimiter,
+  router: T3EnvironmentRouter,
+  aggregateMode: boolean,
   archive: AssistantArchive,
-  phone: PhoneService,
 ): Promise<number> {
   const url = new URL(request.url ?? "/", "http://bridge.invalid");
   const path = url.pathname;
 
-  // Native API is isolated from browser origin exemptions and full bridge credentials.
-  if (path.startsWith("/v1/phone/")) {
-    if (request.headers.origin !== undefined || request.method !== "POST" || url.search) {
-      throw new ApiError(403, "native_only", "Native phone endpoint required");
-    }
-    if (path === "/v1/phone/pair") {
-      if (!pairingLimiter.allow(clientKey(request))) throw new ApiError(429, "pairing_failed", "Pairing failed");
-      sendJson(response, 200, phone.pair(await readPairingBody(request)));
-      return 200;
-    }
-    if (!phone.authenticated(bearerToken(request))) throw new ApiError(401, "unauthorized", "Authentication required");
-    if (path === "/v1/phone/sync") {
-      sendJson(response, 200, phone.sync(await readJsonBody(request, 256 * 1024)));
-      return 200;
-    }
-    throw new ApiError(404, "not_found", "Route not found");
-  }
-
-  if (request.method === "OPTIONS") {
-    if (!originAllowed(request, config)) {
-      throw new ApiError(403, "origin_denied", "Origin is not allowed");
-    }
-    response.writeHead(204, {
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Authorization, Content-Type",
-      "Access-Control-Max-Age": "600",
-    });
-    response.end();
-    return 204;
-  }
-
   if (request.method === "GET" && path === "/health") {
     sendJson(response, 200, { status: "ok" });
-    return 200;
-  }
-
-  if (!originAllowed(request, config)) {
-    throw new ApiError(403, "origin_denied", "Origin is not allowed");
-  }
-
-  if (request.method === "POST" && path === "/v1/pair") {
-    if (!pairingLimiter.allow(clientKey(request))) {
-      throw new ApiError(429, "pairing_failed", "Pairing failed");
-    }
-    let body: Record<string, unknown>;
-    try {
-      body = await readPairingBody(request);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 413) throw error;
-      throw new ApiError(401, "pairing_failed", "Pairing failed");
-    }
-    const passphrase =
-      Object.keys(body).length === 1 &&
-      typeof body.passphrase === "string" &&
-      body.passphrase.length > 0 &&
-      body.passphrase.length <= 256
-        ? body.passphrase
-        : undefined;
-    if (!pairingPassphraseMatches(passphrase, config.bridgePassphrase)) {
-      throw new ApiError(401, "pairing_failed", "Pairing failed");
-    }
-    sendJson(response, 200, { token: config.bridgeToken });
     return 200;
   }
 
@@ -785,10 +934,19 @@ async function routeHttp(
   }
 
   if (request.method === "GET" && path === "/v1/status") {
-    const descriptor = await client.descriptor();
+    const environments = await router.list();
+    let resolved;
+    try { resolved = await router.primary(); }
+    catch {
+      const fallback = environments.find((environment) => environment.status === "connected");
+      if (!fallback) throw new ApiError(503, "upstream_unavailable", "T3 Code is unavailable");
+      resolved = await router.resolve(fallback.environmentId);
+    }
+    const descriptor = await resolved.client.descriptor();
     sendJson(response, 200, {
       bridgeVersion: "0.1.0",
       archive: archive.status(),
+      ...(aggregateMode ? { environments } : {}),
       t3: {
         environmentId: descriptor.environmentId,
         label: descriptor.label,
@@ -798,59 +956,9 @@ async function routeHttp(
     return 200;
   }
 
-  if (request.method === "GET" && path === "/v1/projects") {
-    const snapshot = await client.shell();
-    sendJson(response, 200, {
-      snapshotId: String(snapshot.snapshotSequence),
-      projects: normalizeProjects(snapshot, config),
-    });
+  if (request.method === "GET" && path === "/v1/environments") {
+    sendJson(response, 200, { environments: await router.list() });
     return 200;
-  }
-
-  if (request.method === "GET" && path === "/v1/sessions") {
-    sendJson(response, 200, normalizeSessions(await client.shell(), config));
-    return 200;
-  }
-
-  const transcriptMatch = /^\/v1\/sessions\/([^/]+)\/transcript$/.exec(path);
-  if (request.method === "GET" && transcriptMatch !== null) {
-    const threadId = parsePathId(transcriptMatch[1]);
-    const shell = await client.shell();
-    findThread(shell, threadId, config);
-    const snapshot = await client.thread(threadId);
-    if (snapshot.thread.id !== threadId) {
-      throw new ApiError(502, "upstream_invalid_response", "T3 Code returned an invalid response");
-    }
-    const projectTitle =
-      shell.projects.find((project) => project.id === snapshot.thread.projectId)?.title ??
-      "Unknown project";
-    sendJson(response, 200, normalizeTranscript(snapshot, projectTitle));
-    return 200;
-  }
-
-  if (request.method === "POST" && path === "/v1/sessions") {
-    const body = await readJsonBody(request, config.maxBodyBytes);
-    const result = await startThread(
-      client,
-      config,
-      requiredId(body, "projectId"),
-      parseText(body, config.maxTextChars),
-      parseModelSelection(body),
-    );
-    sendJson(response, 201, result);
-    return 201;
-  }
-
-  const messageMatch = /^\/v1\/sessions\/([^/]+)\/messages$/.exec(path);
-  if (request.method === "POST" && messageMatch !== null) {
-    const result = await sendTurn(
-      client,
-      config,
-      parsePathId(messageMatch[1]),
-      parseText(await readJsonBody(request, config.maxBodyBytes), config.maxTextChars),
-    );
-    sendJson(response, 202, result);
-    return 202;
   }
 
   throw new ApiError(404, "not_found", "Route not found");
@@ -858,27 +966,49 @@ async function routeHttp(
 
 export function createBridgeServer(
   config: BridgeConfig,
-  client: T3Client,
+  clientOrRouter: T3Client | T3EnvironmentRouter,
   transcriber: Transcriber,
+  peerClientFactory?: PeerClientFactory,
 ): Server {
+  const aggregateMode = isEnvironmentRouter(clientOrRouter);
+  const router = asEnvironmentRouter(clientOrRouter);
+  const client = new PrimaryEnvironmentClient(router);
+  const peers = config.peerDirectory && router instanceof ManagedEnvironmentRouter
+    ? new PeerService(config, router, config.peerDirectory, peerClientFactory) : null;
+  const signal = SignalHttp.create(config);
+  const nativeToken = faceclawToken(config.bridgeToken);
+  // Session tool credentials intentionally die with the bridge process, so old
+  // MCP request IDs cannot be replayed after the in-memory receipts are lost.
+  const toolSecret = randomUUID();
+  const providerGrants = new FaceclawProviderGrants(config, client, toolSecret);
+  const relay = new FaceclawRelay(config.faceclawProjectId);
+  const refinement = new RefinementService(config.refinementCodexPath);
+  const faceclawRpcLimiter = new FixedWindowRateLimiter(600);
   const limiter = new FixedWindowRateLimiter(config.rateLimitPerMinute);
   const pairingLimiter = new FixedWindowRateLimiter(
     PAIRING_ATTEMPTS_PER_WINDOW,
     PAIRING_WINDOW_MS,
   );
-  const events = new EventHub(client, config);
-  const phone = new PhoneService(config.bridgeToken, (snapshot) => events.phoneChanged(snapshot), 6000, 10_000, async () => {
-    // Native wake relays receive no titles, transcripts, project paths or T3 action authority.
-    return normalizeSessions(await client.shell(), config).unsettled;
-  });
-  const phoneLimiter = new FixedWindowRateLimiter(240);
+  const events = new EventHub(router, config, aggregateMode);
   const archive = new AssistantArchive(config, client, (status) => events.archiveStatus(status));
   const weather = new WeatherService();
-  const plan = new PlanInputService(client, config);
+  const scopedServices = new Map<string, {
+    client: T3Client;
+    plan: PlanInputService;
+    controls: SessionControlsService;
+  }>();
+  const environmentServices = (environmentId: string, environmentClient: T3Client) => {
+    let value = scopedServices.get(environmentId);
+    if (!value || value.client !== environmentClient) {
+      value = { client: environmentClient, plan: new PlanInputService(environmentClient, config),
+        controls: new SessionControlsService(environmentClient, config) };
+      scopedServices.set(environmentId, value);
+    }
+    return value;
+  };
   // Services are explicitly composed here, never chosen by a client URL,
   // module path, or configuration supplied over the wire.
   const services = new BridgeServiceRegistry([
-    { namespace: "plan", methods: { submit: (params) => plan.submit(params) } },
     {
       namespace: "weather",
       methods: {
@@ -897,16 +1027,95 @@ export function createBridgeServer(
 
   const server = createServer((request, response) => {
     const requestId = safeRequestId();
-    applySecurityHeaders(request, response, config);
+    applySecurityHeaders(response);
     response.setHeader("X-Request-Id", requestId);
     let status = 500;
     void (async () => {
       try {
-        const isPhoneSync = request.url === "/v1/phone/sync";
-        if (!(isPhoneSync ? phoneLimiter : limiter).allow(clientKey(request))) {
+        if (peers && await peers.http(request, response)) { status = response.statusCode; return; }
+        if (!limiter.allow(clientKey(request))) {
           throw new ApiError(429, "rate_limited", "Too many requests");
         }
-        status = await routeHttp(request, response, config, client, pairingLimiter, archive, phone);
+        const url = new URL(request.url ?? '/', 'http://bridge.invalid');
+        // The optional Signal service applies its own policy: an exact
+        // same-origin page for loopback setup, and no Origin for its APK API.
+        if (signal) {
+          const handled = await signal.handle(request, response, url);
+          if (handled !== null) { status = handled; return; }
+        }
+        // Otherwise only native Faceclaw clients and local owner tools connect.
+        // Browser origins have no route on this bridge.
+        if (request.headers.origin !== undefined) {
+          throw new ApiError(403, "native_only", "Browser origins are not accepted");
+        }
+        if (url.pathname.startsWith('/v1/faceclaw/')) {
+          if (request.method !== 'POST' || url.search) {
+            throw new ApiError(403, 'native_only', 'Native Faceclaw endpoint required');
+          }
+          if (url.pathname === '/v1/faceclaw/pair') {
+            if (!pairingLimiter.allow(clientKey(request))) throw new ApiError(429, 'pairing_failed', 'Pairing failed');
+            const body = await readPairingBody(request);
+            if (Object.keys(body).length !== 1 || typeof body.passphrase !== 'string' || !pairingPassphraseMatches(body.passphrase, config.bridgePassphrase)) {
+              throw new ApiError(401, 'pairing_failed', 'Pairing failed');
+            }
+            sendJson(response, 200, { token: nativeToken }); status = 200; return;
+          }
+          if (url.pathname === '/v1/faceclaw/tool-credential') {
+            // Owner-only provisioning. Native phone and MCP credentials cannot mint capabilities.
+            if (!secretMatches(bearerToken(request), config.bridgeToken)) throw new ApiError(401, 'unauthorized', 'Owner credential required');
+            const body = await readJsonBody(request, 2048);
+            const threadId = requiredId(body, 'threadId');
+            const shell = await client.shell();
+            const thread = findThread(shell, threadId, config);
+            if (!config.faceclawProjectId || thread.projectId !== config.faceclawProjectId) throw new ApiError(403, 'tool_scope_denied', 'Assistant project is not enabled');
+            findProject(shell, thread.projectId, config);
+            const binding = { projectId: thread.projectId, threadId, expiresAt: Date.now() + 60 * 60_000 };
+            sendJson(response, 200, { ...binding, token: mintToolToken(toolSecret, binding) }); status = 200; return;
+          }
+          if (url.pathname === '/v1/faceclaw/provider-session') {
+            sendJson(response, 200, await providerGrants.issue(bearerToken(request), await readJsonBody(request, 8192))); status = 200; return;
+          }
+          if (url.pathname === '/v1/faceclaw/provider-renew' || url.pathname === '/v1/faceclaw/provider-revoke') {
+            const binding = verifyToolToken(toolSecret, bearerToken(request), config.faceclawProjectId);
+            const body = await readJsonBody(request, 1024);
+            const result = url.pathname.endsWith('-renew') ? providerGrants.renew(binding, body.leaseToken) : providerGrants.revoke(binding, body.leaseToken);
+            sendJson(response, 200, result); status = 200; return;
+          }
+          if (url.pathname === '/v1/faceclaw/mcp') {
+            const binding = verifyToolToken(toolSecret, bearerToken(request), config.faceclawProjectId);
+            const shell = await client.shell();
+            if (binding.providerSessionId) providerGrants.validate(binding);
+            else {
+              const thread = findThread(shell, binding.threadId!, config);
+              if (thread.projectId !== binding.projectId) throw new ApiError(403, 'tool_scope_denied', 'Assistant project is not enabled');
+            }
+            findProject(shell, binding.projectId, config);
+            const body = await readJsonBody(request, 16 * 1024);
+            if (body.jsonrpc !== '2.0' || typeof body.method !== 'string' ||
+                (body.id !== undefined && !(typeof body.id === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(body.id)) && !(typeof body.id === 'number' && Number.isSafeInteger(body.id)))) {
+              throw new ApiError(400, 'invalid_request', 'Invalid MCP request');
+            }
+            if (body.method === 'notifications/initialized' && body.id === undefined) { response.writeHead(202); response.end(); status = 202; return; }
+            if (body.id === undefined) throw new ApiError(400, 'invalid_request', 'MCP request ID required');
+            let result: unknown;
+            try {
+              if (body.method === 'initialize') result = { protocolVersion: '2025-03-26', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'faceclaw-t3', version: '1.0.0' } };
+              else if (body.method === 'ping') result = {};
+              else if (body.method === 'tools/list') result = relay.list();
+              else if (body.method === 'tools/call') {
+                if (!body.params || typeof body.params !== 'object' || Array.isArray(body.params)) throw new ApiError(400, 'invalid_request', 'Invalid tool call');
+                result = await relay.call(binding, String(body.id), body.params as Record<string, unknown>);
+              } else throw new ApiError(404, 'method_not_found', 'MCP method not found');
+              sendJson(response, 200, { jsonrpc: '2.0', id: body.id, result });
+            } catch (error) {
+              const safe = error instanceof ApiError ? error : new ApiError(500, 'internal_error', 'Tool request failed');
+              sendJson(response, 200, { jsonrpc: '2.0', id: body.id, error: { code: -32000, message: safe.message, data: { code: safe.code } } });
+            }
+            status = 200; return;
+          }
+          throw new ApiError(404, 'not_found', 'Route not found');
+        }
+        status = await routeHttp(request, response, config, router, aggregateMode, archive);
       } catch (error) {
         if (response.headersSent || response.destroyed) return;
         const safe =
@@ -914,32 +1123,13 @@ export function createBridgeServer(
             ? error
             : new ApiError(500, "internal_error", "The bridge could not complete the request");
         status = safe.status;
-        // Temporary, rejection-only pairing diagnostics. Do not log other headers,
-        // request bodies, raw URLs, or any authentication material.
-        if (
-          safe.code === "origin_denied" &&
-          (request.method === "OPTIONS" || request.method === "POST") &&
-          new URL(request.url ?? "/", "http://bridge.invalid").pathname === "/v1/pair"
-        ) {
-          process.stdout.write(`${JSON.stringify({
-            level: "info",
-            event: "pairing_origin_denied",
-            requestId,
-            method: request.method,
-            path: "/v1/pair",
-            status,
-            reason: "origin_denied",
-            origin: diagnosticOrigin(request.headers.origin),
-            at: new Date().toISOString(),
-          })}\n`);
-        }
         if (safe.status === 401) response.setHeader("WWW-Authenticate", "Bearer");
         sendJson(response, safe.status, {
           error: { code: safe.code, message: safe.message },
           requestId,
         });
       } finally {
-        if (request.url !== "/v1/phone/sync") logRequest(
+        logRequest(
           requestId,
           request.method ?? "UNKNOWN",
           request.url?.split("?", 1)[0] ?? "/",
@@ -950,12 +1140,12 @@ export function createBridgeServer(
   });
 
   server.on("upgrade", (request, socket, head) => {
+    if (peers?.upgrade(request, socket, head)) return;
     const url = new URL(request.url ?? "/", "http://bridge.invalid");
     if (
-      url.pathname !== "/v1/events" ||
-      !originAllowed(request, config) ||
+      url.pathname !== "/v1/faceclaw/events" || request.headers.origin !== undefined || !!url.search ||
       !limiter.allow(clientKey(request)) ||
-      !secretMatches(websocketToken(request), config.bridgeToken)
+      !secretMatches(websocketToken(request), nativeToken)
     ) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       socket.destroy();
@@ -978,10 +1168,9 @@ export function createBridgeServer(
     });
   });
 
-  websocketServer.on("connection", (socket) => {
+  websocketServer.on("connection", (socket, handshake) => {
     const state = events.add(socket);
     sendEvent(state, "archive.status", archive.status());
-    sendEvent(state, "phone.changed", phone.snapshot());
     socket.on("pong", () => {
       state.alive = true;
     });
@@ -1018,7 +1207,7 @@ export function createBridgeServer(
       }
 
       const textData = rawDataBuffer(data);
-      if (textData.byteLength > MAX_WS_JSON_BYTES) {
+      if (textData.byteLength > MAX_WS_FRAME_BYTES) {
         socket.close(1009, "Request is too large");
         return;
       }
@@ -1029,23 +1218,53 @@ export function createBridgeServer(
         sendRpcError(state, "invalid", error);
         return;
       }
-      void routeRpc(request, state, config, client, transcriber, events, services, phone).then(
+      const dispatch = async (): Promise<unknown> => {
+        if (request.method !== 'refinement.cancel' && !['faceclaw.tools.result','faceclaw.capabilities.result'].includes(request.method) && !faceclawRpcLimiter.allow(clientKey(handshake))) {
+          throw new ApiError(429, 'rate_limited', 'Too many Faceclaw requests');
+        }
+        if (request.method.startsWith('faceclaw.') || request.method.startsWith('refinement.')) {
+          switch (request.method) {
+            case 'faceclaw.tools.register': return relay.register(state, request.params, payload => sendEvent(state, 'faceclaw.tool.call', payload));
+            case 'faceclaw.tools.result': return relay.result(state, request.params);
+            case 'faceclaw.capabilities.register': return relay.register(state, request.params, payload => sendEvent(state, 'faceclaw.capability.call', payload), true);
+            case 'faceclaw.capabilities.result': return relay.result(state, request.params);
+            case 'refinement.cancel': {
+              const cancelled = state.refinement !== null;
+              state.refinement?.abort();
+              return { cancelled };
+            }
+            case 'refinement.rewrite': {
+              if (state.refinement) throw new ApiError(409, 'refinement_busy', 'Refinement is already in progress');
+              const abort = new AbortController(); state.refinement = abort;
+              try { return await refinement.rewrite(request.params, abort.signal); }
+              finally { if (state.refinement === abort) state.refinement = null; }
+            }
+            default: throw new ApiError(404, 'method_not_found', 'Method not found');
+          }
+        }
+        return routeRpc(request, state, config, router, aggregateMode, transcriber, events, services, environmentServices);
+      };
+      void dispatch().then(
         (result) => sendRpcResult(state, request.id, result),
         (error: unknown) => sendRpcError(state, request.id, error),
       );
     });
-    socket.on("close", () => events.remove(state));
+    socket.on("close", () => { relay.disconnect(state); events.remove(state); });
   });
 
   const heartbeat = setInterval(() => events.heartbeat(), 30_000);
   heartbeat.unref();
   server.once("listening", () => archive.start());
+  server.once('listening', () => signal?.start());
   server.on("close", () => {
+    peers?.close();
+    signal?.close();
     archive.stop();
-    phone.close();
     clearInterval(heartbeat);
     websocketServer.close();
   });
 
+  const close = server.close.bind(server);
+  server.close = (callback?: (error?: Error) => void) => { peers?.close(); return close(callback); };
   return server;
 }

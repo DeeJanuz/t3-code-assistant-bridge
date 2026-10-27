@@ -8,12 +8,15 @@ import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { tailscaleInfoFromStatus, tailscaleServePortState, validatePort } from './deployment-helpers.mjs';
+import { archiveEnvironment, tailscaleInfoFromStatus, tailscaleServePortState, validatePort } from './deployment-helpers.mjs';
 import { cleanPath, connectionInfo, dataDirectory, loopbackT3Url, resolveT3Entry, systemdUnit, windowsTaskScript } from './portable-deployment.mjs';
 const exec = promisify(execFile);
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 async function command(executable, args) {
-  try { return await exec(executable, args, { encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 * 1024, windowsHide: true }); }
+  // A PowerShell 7 parent's PSModulePath stops Windows PowerShell 5.1 from loading built-in modules.
+  const env = path.basename(executable).toLowerCase() === 'powershell.exe'
+    ? Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'psmodulepath')) : process.env;
+  try { return await exec(executable, args, { encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env }); }
   catch { throw new Error(`A ${path.basename(executable)} command failed. Inspect prerequisites and permissions; no command output or credentials were logged.`); }
 }
 async function exists(file) { try { await lstat(file); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
@@ -38,7 +41,7 @@ async function freePort(port) {
 }
 export function parseArguments(argv) {
   const options = { httpsPort: 8443, bridgePort: 8787, t3BaseUrl: 'http://127.0.0.1:3773', t3BaseDir: path.join(homedir(), '.t3'), dryRun: false };
-  const values = { '--https-port': 'httpsPort', '--bridge-port': 'bridgePort', '--t3-url': 't3BaseUrl', '--t3-base-dir': 't3BaseDir', '--t3-executable': 't3Executable', '--t3-entry': 't3Entry', '--whisper-executable': 'whisperExecutable', '--whisper-model': 'whisperModel', '--tailscale-executable': 'tailscaleExecutable' };
+  const values = { '--https-port': 'httpsPort', '--bridge-port': 'bridgePort', '--t3-url': 't3BaseUrl', '--t3-base-dir': 't3BaseDir', '--t3-executable': 't3Executable', '--t3-entry': 't3Entry', '--refinement-codex-path': 'refinementCodexPath', '--whisper-executable': 'whisperExecutable', '--whisper-model': 'whisperModel', '--tailscale-executable': 'tailscaleExecutable', '--archive-project-id': 'archiveProjectId', '--archive-workspace-root': 'archiveWorkspaceRoot' };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--dry-run') { options.dryRun = true; continue; }
     const key = values[argv[i]];
@@ -48,26 +51,37 @@ export function parseArguments(argv) {
   options.httpsPort = validatePort(options.httpsPort); options.bridgePort = validatePort(options.bridgePort);
   if (options.httpsPort === options.bridgePort) throw new Error('Bridge and HTTPS ports must differ');
   options.t3BaseUrl = loopbackT3Url(options.t3BaseUrl);
-  for (const key of ['t3Executable', 't3Entry', 't3BaseDir', 'whisperExecutable', 'whisperModel', 'tailscaleExecutable']) {
+  for (const key of ['t3Executable', 't3Entry', 't3BaseDir', 'whisperExecutable', 'whisperModel', 'tailscaleExecutable', 'refinementCodexPath']) {
+    if (['refinementCodexPath', 't3Entry'].includes(key) && !options[key]) continue;
     if (!options[key]) throw new Error(`Missing ${key}; the installation skill must discover the installed prerequisite first`);
     cleanPath(options[key]);
   }
+  // Both or neither; the bridge rejects archive setup on Windows at startup.
+  archiveEnvironment(options.archiveProjectId, options.archiveWorkspaceRoot);
   return options;
 }
 export const HELP = `Usage: node scripts/install-portable.mjs [--dry-run] OPTIONS
 
 First install for Windows/Linux; use scripts/install.sh on macOS.
 Required absolute paths:
-  --t3-executable PATH       Existing T3 Electron executable or Node executable
-  --t3-entry PATH            Existing T3 server bin.mjs (including app.asar path)
+  --t3-executable PATH       Existing T3 Electron, Node, or native t3 CLI executable
+  --refinement-codex-path PATH
+                              Codex CLI used for optional Luna refinement
   --whisper-executable PATH  Installed whisper-server executable
   --whisper-model PATH       Verified ggml-base.en.bin
   --tailscale-executable PATH Installed Tailscale executable
 Optional:
+  --t3-entry PATH            Existing T3 server bin.mjs (including app.asar path);
+                              required unless --t3-executable is the native t3 CLI.
+                              The CLI of T3's active runtime under the base directory
+                              takes precedence whenever it exists.
   --t3-base-dir PATH         Existing T3 state directory (default: ~/.t3)
   --t3-url ORIGIN            Numeric loopback HTTP origin (default: http://127.0.0.1:3773)
   --https-port PORT          Private Tailscale HTTPS port (default: 8443)
   --bridge-port PORT         Local bridge port (default: 8787)
+  --archive-project-id ID    T3 project whose conversations are archived (macOS/Linux)
+  --archive-workspace-root PATH
+                              That project's workspace; both archive flags are required together
   --dry-run                 Show plan without creating files or services
   --help, -h                Show this help without inspecting host state
 `;
@@ -88,7 +102,12 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
   for (const key of ['t3Executable', 't3BaseDir', 'whisperExecutable', 'whisperModel', 'tailscaleExecutable']) await access(options[key]);
-  options.t3Entry = await resolveT3Entry(options.t3Entry);
+  if (options.refinementCodexPath) await access(options.refinementCodexPath);
+  if (options.archiveWorkspaceRoot) {
+    const stat = await lstat(options.archiveWorkspaceRoot);
+    if (!stat.isDirectory() || await realpath(options.archiveWorkspaceRoot) !== options.archiveWorkspaceRoot) throw new Error('Archive workspace must be an existing local directory without symlinks');
+  }
+  if (options.t3Entry) options.t3Entry = await resolveT3Entry(options.t3Entry);
   await access(path.join(repo, 'bridge', 'dist', 'src', 'runtime.js'));
   const compiled = await import(pathToFileURL(path.join(repo, 'bridge', 'dist', 'src', 'config.js')).href);
   // Validate secure defaults using the same parser as the running bridge.

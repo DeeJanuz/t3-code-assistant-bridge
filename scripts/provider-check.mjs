@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { tailscaleOrigins } from './deployment-helpers.mjs';
+import { nativeToken } from './portable-deployment.mjs';
 
 function rpc(socket, id, method, params = {}, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
@@ -23,13 +24,13 @@ export async function verifyProviders(config, token, dependencies = {}) {
   const { httpsOrigin, eventsUrl } = tailscaleOrigins(config.host, config.httpsPort);
   const request = dependencies.request ?? fetch;
   const response = await request(`${httpsOrigin}/v1/status`, {
-    headers: { Origin: 'null', Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${token}` },
     redirect: 'error', signal: AbortSignal.timeout(15000),
   });
   await response.body?.cancel();
   if (response.status !== 200) throw new Error('Authenticated T3 readiness check failed');
   const WebSocket = dependencies.WebSocket ?? createRequire(new URL('../bridge/package.json', import.meta.url))('ws');
-  const socket = new WebSocket(eventsUrl, ['even-t3-v1', `auth.${token}`], { origin: 'null', maxPayload: 4 * 1024 * 1024, handshakeTimeout: 15000 });
+  const socket = new WebSocket(eventsUrl, ['even-t3-v1', `auth.${nativeToken(token)}`], { maxPayload: 4 * 1024 * 1024, handshakeTimeout: 15000 });
   // Suppress raw socket errors: URLs and server responses may contain private data.
   socket.on('error', () => {});
   try {

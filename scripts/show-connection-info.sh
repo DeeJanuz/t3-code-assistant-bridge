@@ -25,18 +25,18 @@ validate_port "$HTTPS_PORT" "stored HTTPS port"
 validate_port "$BRIDGE_PORT" "stored bridge port"
 
 CURRENT_HOST="$("$TAILSCALE" status --json 2>/dev/null | "$NODE_PATH" "$SCRIPT_DIR/deployment-helpers.mjs" tailscale-host)" || fail "Tailscale is unavailable or disconnected. Open Tailscale, connect this Mac, then try again."
-[[ "$STORED_HOST" == "$CURRENT_HOST" ]] || fail "The installed app was packaged for a different Tailscale host. Run scripts/install.sh again."
+[[ "$STORED_HOST" == "$CURRENT_HOST" ]] || fail "The bridge was installed for a different Tailscale host. Run scripts/install.sh again."
 
 SERVE_STATE="$("$TAILSCALE" serve status --json 2>/dev/null | "$NODE_PATH" "$SCRIPT_DIR/deployment-helpers.mjs" serve-port-state "$CURRENT_HOST" "$HTTPS_PORT" "$BRIDGE_PORT")" || fail "Tailscale Serve is unavailable. Reconnect Tailscale or run scripts/install.sh again."
 [[ "$SERVE_STATE" == "ours" ]] || {
   if [[ "$SERVE_STATE" == "empty" ]]; then
-    fail "The T3 Code Assistant Tailscale Serve handler is missing. Run scripts/install.sh again."
+    fail "The Faceclaw T3 Bridge Tailscale Serve handler is missing. Run scripts/install.sh again."
   fi
-  fail "Tailscale Serve port $HTTPS_PORT does not match this T3 Code Assistant deployment. Review it before reinstalling."
+  fail "Tailscale Serve port $HTTPS_PORT does not match this Faceclaw T3 Bridge deployment. Review it before reinstalling."
 }
 
 WSS_URL="$("$NODE_PATH" "$SCRIPT_DIR/deployment-helpers.mjs" events-url "$CURRENT_HOST" "$HTTPS_PORT")" || fail "Could not create a safe bridge URL."
-note "WebSocket URL:"
+note "T3 bridge URL:"
 note "$WSS_URL"
-note "Copy this exact URL into the T3 Code Assistant setup screen on your phone."
+note "Enter this exact URL in the T3 app's bridge settings on your phone."
 note "This command does not display the pairing passphrase or bearer token."

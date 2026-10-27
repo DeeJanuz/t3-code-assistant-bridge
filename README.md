@@ -1,73 +1,76 @@
-# T3 Code Assistant Bridge
+# Faceclaw T3 Bridge
 
-**T3 Code Assistant** connects your existing T3 Code installation, Even Realities G2 glasses, and an optional Android notification companion. Read conversations, dictate and review replies, answer plan questions, and see local weather from your glasses.
+Connects the [Faceclaw](https://github.com/DeeJanuz/faceclaw) T3 app on Even Realities G2 glasses to an existing T3 Code installation. The glasses can read and continue conversations, start sessions, dictate and review replies, answer plan questions, change models, and expose glasses tools to T3 agents.
 
-**Public beta:** Even Hub app 0.5.7. The computer bridge and glasses frontend are in this repository. The [Android companion](https://github.com/DeeJanuz/even-t3-android) has its own source and signed APK releases. This is an independent community project, not an official T3 Code or Even Realities product.
+This is an independent community project, not an official T3 Code or Even Realities product. For the Even Hub app, use the separate [T3 Code Assistant Bridge](https://github.com/DeeJanuz/t3-code-assistant-bridge).
 
-## Install with your T3 Code agent
+## How it fits together
 
-T3 Code and a working agent/provider are assumed to be installed already. You do not need to follow a terminal setup guide yourself.
+- **Faceclaw host and T3 app (phone):** [Faceclaw](https://github.com/DeeJanuz/faceclaw) owns the glasses connection. The [T3 app](https://github.com/DeeJanuz/faceclaw-t3-app) draws the T3 screens and talks to this bridge.
+- **Bridge (computer):** Connects to the local T3 Code server and to explicitly paired bridges on your other computers, and runs local Whisper transcription. T3 credentials stay on the computer. The phone gets its own scoped token.
+- **T3 Code:** Owns projects, conversations, models, and agent execution. T3 Code and a working agent provider must already be installed.
 
-1. Download [SKILL.md](https://raw.githubusercontent.com/DeeJanuz/t3-code-assistant-bridge/main/skills/t3-bridge-deploy/SKILL.md), or copy its contents into a T3 Code conversation.
-2. Ask your agent: **“Use this skill to install T3 Code Assistant on this computer, install its missing prerequisites, configure automatic startup, and give me my phone setup details.”**
-3. Complete any operating-system administrator or Tailscale sign-in prompts on your own device. The agent builds the app, verifies the bridge, and supplies your `.ehpk`, endpoint URLs, and local pairing instructions.
+The bridge listens on loopback only. Phones reach it through Tailscale Serve over private HTTPS/WSS with normal certificate validation. Keep T3 Code running and the computer awake while using the assistant.
 
-The skill covers Windows, macOS, and Linux. It installs or discovers Node.js, Git, Tailscale, and local whisper.cpp transcription, preserving your existing T3 installation and projects. Mac uses a user LaunchAgent; Windows uses a user Scheduled Task; Linux uses a user systemd service. Startup is at sign-in. Keep T3 Code running and the computer awake while using the glasses.
+## Install
 
-Mac deployment has been exercised locally. Windows and Linux installers are beta paths with automated platform tests; a successful dry run or CI build does not establish a complete phone-to-glasses hardware test on those platforms. The optional assistant archive is unavailable on Windows; the normal bridge, notifications, weather, and voice features remain supported.
+T3 Code and a working agent provider are assumed to be installed.
 
-## Finish setup on your phone
-
-Use Android 9 or newer and an Even Realities app compatible with Even Hub SDK 0.0.14 (minimum host version 2.2.9).
-
-1. **Private network:** Install Tailscale on the phone and sign in to the same tailnet as your computer. Complete VPN approval if Android requests it.
-2. **Even Hub app:** Use the personalized `.ehpk` supplied by the installer. Upload it through your [Even Hub developer portal](https://hub.evenrealities.com/login), assign the build to a beta group containing your Even account, and install it from the Even Realities phone app. Your agent can prepare the package; account sign-in and beta access belong to you.
-3. **Bridge connection:** In T3 Code Assistant’s phone settings, enter the installer’s **WebSocket URL** and your **pairing passphrase**, then save. The passphrase is exchanged for a scoped token and cleared from the form. Do not paste credentials into a T3 conversation, GitHub issue, or screenshot.
-4. **Assistant and weather:** Choose an existing T3 project and model under Dashboard settings. Allow location for the Even Realities Android app, or choose a fallback city. Every new conversation created through this app uses full access, including its first turn, without supervised approval prompts. Existing conversations keep their current access mode. Update the computer bridge to apply this behavior.
-5. **Optional phone messages:** Download the signed beta APK from [Android releases](https://github.com/DeeJanuz/even-t3-android/releases). Open it on the phone and allow that installer to install unknown apps. Enable notification access for Even Phone Companion. If Android blocks a sideloaded app’s notification access, enable **Allow restricted settings** in that app’s Android settings first.
-6. In Even Hub’s **Android notifications** section, select **Pair Android companion**. In the Android companion, enter the installer’s **HTTPS bridge origin** and the short-lived pairing code. Enable only the messaging apps you want to forward in Even Hub’s app list. No messaging-account password is needed.
-
-The companion forwards individual notifications that offer a compatible text-reply action. It does not forward every notification. See the [Android setup and behavior guide](https://github.com/DeeJanuz/even-t3-android#readme) for permissions and device restrictions.
-
-## Which URLs go where?
-
-Your installer prints the exact values for **your** computer. These examples show the format; do not paste the example hostname into settings.
-
-| Setting | Value |
-| --- | --- |
-| Even Hub → Bridge connection → WebSocket URL | `wss://YOUR-COMPUTER.YOUR-TAILNET.ts.net:8443/v1/events` |
-| Android companion → HTTPS bridge origin | `https://YOUR-COMPUTER.YOUR-TAILNET.ts.net:8443` |
-| Even Hub pairing passphrase | Your local bridge pairing passphrase, not a URL or Android pairing code |
-| Android companion pairing code | A fresh code from Even Hub → Android notifications |
-
-The default private HTTPS port is 8443. If the installer chooses another port, use that value in both URLs. `localhost` on your phone points to the phone, not your computer.
-
-**Personalized Even Hub builds are required.** Even’s [networking documentation](https://hub.evenrealities.com/docs/build/networking) requires exact allowed origins and does not support wildcard hosts. A package built for one computer cannot be reused for an unrelated hostname. The skill builds your package for your hostname; changing hosts requires repackaging. We do not publish a universal `.ehpk` pointing at the maintainer’s private computer or expose the bridge through Tailscale Funnel.
-
-## What runs where?
-
-- **Computer:** Authenticated bridge, connection to your existing T3 Code server, and local Whisper transcription. Notification forwarding works independently of T3 availability; T3 actions require T3 Code to be available.
-- **Glasses / Even Hub:** Dashboard, top Notifications N control, conversations, full-screen dictation and review, and phone settings. Standard single tap, double tap, swipe, and contextual-menu behavior applies without gesture hints on each screen.
-- **Optional Android companion:** Opt-in notification access and local reply handoff. Notification/reply contents are not stored by the companion. Android handoff confirms acceptance by the messaging app, not delivery to the recipient.
-
-The transport stays private through Tailscale Serve and normal HTTPS certificate validation. T3 credentials remain on the computer; the phone uses separately scoped credentials. Weather queries use approximate coordinates and the Open-Meteo noncommercial service. Source-code licensing does not change third-party service terms.
-
-The app keeps its existing package identity and pairing storage for compatible upgrades. Installed service names and data directories retain their original identifiers.
-
-Returning from a notification goes directly to the dashboard when no notifications remain. Otherwise, it returns to the notification list. Empty recordings and blank transcripts cannot be sent to T3 Code; the bridge also rejects digital silence before transcription. Update the computer bridge along with the glasses app to receive the recording checks.
+1. Give [SKILL.md](skills/t3-bridge-deploy/SKILL.md) to your T3 Code agent and ask it to install the Faceclaw T3 Bridge on this computer. It installs missing prerequisites (Node.js, Tailscale, whisper.cpp), configures startup at sign-in, and verifies the result. On macOS you can also run `./scripts/install.sh --dry-run` and then `./scripts/install.sh` yourself.
+2. The installer prints a **T3 bridge URL** such as `wss://YOUR-COMPUTER.YOUR-TAILNET.ts.net:8443/v1/faceclaw/events`. Run `npm run connection-info` to print it again.
+3. On the phone, join the same tailnet in Tailscale, install Faceclaw and the T3 app, and approve the T3 app in Faceclaw.
+4. In the T3 app's settings, enter the T3 bridge URL and your pairing passphrase. The passphrase is exchanged for a scoped token and is not stored. Do not paste credentials into conversations, issues, or screenshots.
 
 ## Develop and verify
 
+Run from this repository:
+
 ```sh
-npm ci
 npm ci --prefix bridge
 npm run check:all
 ```
 
-Run `npm run dev` for local frontend development. Debug input panels, display probes, and synthetic-notification buttons are omitted from beta builds; local developers can opt in with `?debug=1`. `tests/manual/dashboard.html?notifications=phone` provides synthetic native-simulator scenarios without sending real messages.
+For isolated Faceclaw integration testing:
 
-See [session behavior](docs/session-behavior.md), [computer bridge internals](bridge/README.md), [dashboard extensions](docs/dashboard-extensions.md), [plan questions](docs/plan-questions.md), and the [installer skill](skills/t3-bridge-deploy/SKILL.md). T3’s orchestration API is not a stable third-party SDK; rerun compatibility checks after upgrading T3 Code. Real glasses and a physical Android phone remain necessary to assess Bluetooth latency, microphone delivery, and background restrictions.
+```sh
+npm --prefix bridge run build
+node scripts/faceclaw-dev-server.mjs
+```
+
+The fixture runs on loopback port 18790 with synthetic projects, conversations, and responses. It does not load installed configuration, real credentials, or user T3 data. See the [local UI testing instructions](docs/faceclaw.md#local-ui-testing) for connection details and fixture limitations.
+
+The fixture checks application flow. Real speech recognition, model execution, and Bluetooth behavior still require integration testing with the relevant services and hardware. Run `npm run check:all` after runtime changes.
+
+## Pair computer bridges
+
+Install a bridge on each T3 computer, then follow [peer setup and revocation](docs/peers.md). The bridge the phone connects to aggregates paired computers without T3 Connect credentials or an open T3 desktop window, and routes each session to the computer that owns it.
+
+## Connect Faceclaw
+
+Faceclaw pairs through `/v1/faceclaw/pair` and connects to `/v1/faceclaw/events`. Requests with a browser `Origin` header are rejected. Use the [Faceclaw integration guide](docs/faceclaw.md) for native transport, optional draft refinement, and provider setup that exposes glasses tools to T3.
+
+The optional Signal service supports the Faceclaw messaging app's legacy bridge mode; new installs of that app connect to Signal directly. The app has its own phone setup screen. On the glasses, New conversation opens its contact/group directory with voice search; the home list shows retained conversations in newest-message order. The bridge supplies `lastMessageAt` from retained messages, so contact sync and unsent drafts do not create chats. Signal history from before linking is unavailable (`historyImport: false`), and a chat leaves this list when its final retained message expires or is deleted. See the [Signal guide](docs/signal.md) for setup, retention and protocol details.
+
+## Documentation
+
+- [Optional Signal service, APK protocol and scoped assistant tools](docs/signal.md)
+- [Faceclaw integration and local testing](docs/faceclaw.md)
+- [Computer bridge internals and protocol](bridge/README.md)
+- [Bridge federation across computers](docs/peers.md)
+- [Assistant context directory](docs/assistant-context.md)
+
+The bridge requires T3 Code orchestration protocol 2 (orchestration V2, T3 Code 0.0.46 and newer). T3's orchestration API is not a stable third-party SDK. Rerun compatibility checks after upgrading T3 Code; see [T3 compatibility](bridge/README.md#t3-compatibility).
 
 ## License
 
-[MIT](LICENSE). You may use, modify, redistribute, or sell the original code while retaining its license notice. No monetization restriction or copyleft requirement is added. Fonts, icons, libraries, and external services retain their own terms; see [third-party notices](THIRD_PARTY_NOTICES.md).
+[MIT](LICENSE). You may use, modify, redistribute, or sell the original code while retaining its license notice. No monetization restriction or copyleft requirement is added. Libraries and external services retain their own terms; see [third-party notices](THIRD_PARTY_NOTICES.md).
+
+## Transcript token usage
+
+Normalized transcripts include `tokenUsage: { contextTokens, contextWindowTokens, totalTokens, latestTotalTokens, updatedAt }`, with nullable values. The bridge reads T3 Code provider turns: the newest `tokenUsage.usedTokens` and `maxTokens` supply context occupancy and capacity. V2 reports no cumulative counter, so thread-lifetime usage is the sum of each provider turn's complete `turnTokenUsage` input and output tokens, and it is unknown once any turn reported partial or no usage. `latestTotalTokens` is that running sum at the newest report. It never adds occupancy snapshots or cached/reasoning subtotals. Compaction can reduce context without reducing the lifetime total. The glasses use the latest counter to display usage since an observed model switch. Providers without the corresponding fields remain unknown. Raw provider payloads are not forwarded.
+
+The source contract was checked against T3 Code `0.0.46-nightly.20261013.3053` (`orchestrationV2.ts`, `providerRuntime.ts`). Deploy the rebuilt bridge with the matching T3 APK to enable its CTX/TOTAL header.
+
+### Assistant questions in ordinary sessions
+
+Pending V2 `user_input` runtime requests are exposed for running turns in both `default` and `plan` interaction modes. The existing `pendingPlanInput` and `plan.submit` wire names remain for compatibility. Answers still require the current request identity and revision, session/project authorization, review, and explicit submission through `runtime-request.respond`. Approval events and free-form transcript text do not become questions. Restart the bridge after rebuilding to activate this behavior; use a T3 APK that displays pending-question alerts.

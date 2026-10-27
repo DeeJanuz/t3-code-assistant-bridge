@@ -13,7 +13,7 @@ export async function main(configPath) {
   cleanPath(configPath);
   const config = JSON.parse(await readPrivateFile(configPath));
   const credentials = JSON.parse(await readPrivateFile(path.join(path.dirname(configPath), 'credentials.json')));
-  if (!/^[A-Za-z0-9_-]{32,256}$/.test(credentials.bridgeToken) || !/^[A-Za-z0-9_-]{32,256}$/.test(credentials.pairingPassphrase)) throw new Error('Invalid stored credentials');
+  if (!/^[A-Za-z0-9_-]{32,256}$/.test(credentials.bridgeToken) || !/^[A-Za-z0-9_-]{12,256}$/.test(credentials.pairingPassphrase)) throw new Error('Invalid stored credentials');
   const inherited = {};
   for (const key of ['PATH', 'Path', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'XDG_RUNTIME_DIR']) {
     if (process.env[key]) inherited[key] = process.env[key];

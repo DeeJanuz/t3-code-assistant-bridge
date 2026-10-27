@@ -1,6 +1,9 @@
+import { normalizeTokenUsage } from "./token-usage.js";
+import { normalizePendingProposedPlan } from "./session-controls.js";
 import { ApiError, isSafeId } from "./security.js";
 import { normalizePendingPlanInput } from "./plan-input.js";
 import type {
+  BridgeEnvironment,
   BridgeConfig,
   T3Message,
   T3LiveActivity,
@@ -11,6 +14,11 @@ import type {
   T3ThreadShell,
   T3ThreadSnapshot,
 } from "./types.js";
+
+type EnvironmentIdentity = Pick<BridgeEnvironment, "environmentId" | "label">;
+const environmentFields = (environment?: EnvironmentIdentity) => environment
+  ? { environmentId: environment.environmentId, environmentLabel: environment.label }
+  : {};
 
 function validTime(value: string | null | undefined): number | null {
   if (!value) return null;
@@ -82,7 +90,7 @@ export function findThread(
   return thread;
 }
 
-export function normalizeProjects(snapshot: T3ShellSnapshot, config: BridgeConfig) {
+export function normalizeProjects(snapshot: T3ShellSnapshot, config: BridgeConfig, environment?: EnvironmentIdentity) {
   const interactedAt = new Map<string, number>();
   for (const thread of snapshot.threads) {
     // User activity, not assistant completion or project metadata edits, determines recency.
@@ -93,6 +101,7 @@ export function normalizeProjects(snapshot: T3ShellSnapshot, config: BridgeConfi
   return snapshot.projects
     .filter((project) => project.deletedAt == null && projectAllowed(project.id, config))
     .map((project) => ({
+      ...environmentFields(environment),
       id: project.id,
       title: project.title,
       canStartSession: true,
@@ -115,8 +124,22 @@ export function completedTurn(thread: T3ThreadShell): { id: string; completedAt:
   return { id: turn.turnId, completedAt: iso };
 }
 
-function sessionSummary(thread: T3ThreadShell, projects: ReadonlyMap<string, T3Project>) {
+export type SessionBackground = "subagents" | "monitoring";
+
+/** Work T3 keeps running after the turn settles. Unknown values are ignored. */
+export function sessionBackground(thread: T3ThreadShell): SessionBackground | null {
+  if (thread.backgroundLiveness === "working") return "subagents";
+  if (thread.backgroundLiveness === "monitoring") return "monitoring";
+  return null;
+}
+
+function waitingOnUser(thread: T3ThreadShell): boolean {
+  return thread.hasPendingUserInput === true && thread.latestTurn?.state === "running";
+}
+
+function sessionSummary(thread: T3ThreadShell, projects: ReadonlyMap<string, T3Project>, environment?: EnvironmentIdentity) {
   return {
+    ...environmentFields(environment),
     id: thread.id,
     projectId: thread.projectId,
     projectTitle: projects.get(thread.projectId)?.title ?? "Unknown project",
@@ -125,26 +148,41 @@ function sessionSummary(thread: T3ThreadShell, projects: ReadonlyMap<string, T3P
     lastActivityAt: activityAt(thread),
     settled: thread.settledOverride === "settled",
     completedTurn: completedTurn(thread),
+    hasPendingUserInput: waitingOnUser(thread),
+    background: sessionBackground(thread),
   };
 }
 
-export function normalizeSessions(snapshot: T3ShellSnapshot, config: BridgeConfig) {
+/** T3's sidebar keeps this many of the newest settled threads; it pages older ones on demand. */
+export const RECENT_SETTLED_LIMIT = 25;
+
+/** The newest settled threads by settle time, ties at the cut included, as T3 keeps them. */
+function recentSettled(threads: readonly T3ThreadShell[]): T3ThreadShell[] {
+  const settledAt = (thread: T3ThreadShell) => validTime(thread.settledAt);
+  const times = threads.map(settledAt).filter((time): time is number => time !== null).sort((left, right) => right - left);
+  const cut = times[RECENT_SETTLED_LIMIT - 1] ?? -Infinity;
+  // A missing or unreadable settle time is never counted as older, matching T3.
+  return threads.filter((thread) => (settledAt(thread) ?? Infinity) >= cut);
+}
+
+export function normalizeSessions(snapshot: T3ShellSnapshot, config: BridgeConfig, environment?: EnvironmentIdentity) {
   const projects = new Map(
     snapshot.projects
       .filter((project) => project.deletedAt == null && projectAllowed(project.id, config))
       .map((project) => [project.id, project] as const),
   );
+  // Subagent children never settle, so they would pile up. Show one only while it waits on the user.
   const visible = snapshot.threads.filter(
-    (thread) => thread.archivedAt === null && projects.has(thread.projectId),
+    (thread) => thread.archivedAt === null && projects.has(thread.projectId) &&
+      (thread.subagent !== true || waitingOnUser(thread)),
   );
   const unsettled = visible
     .filter((thread) => thread.settledOverride !== "settled")
     .sort(compareActivity)
-    .map((thread) => sessionSummary(thread, projects));
-  const settled = visible
-    .filter((thread) => thread.settledOverride === "settled")
+    .map((thread) => sessionSummary(thread, projects, environment));
+  const settled = recentSettled(visible.filter((thread) => thread.settledOverride === "settled"))
     .sort(compareActivity)
-    .map((thread) => sessionSummary(thread, projects));
+    .map((thread) => sessionSummary(thread, projects, environment));
   return {
     snapshotId: String(snapshot.snapshotSequence),
     frozenAt: snapshot.updatedAt,
@@ -630,10 +668,27 @@ function normalizeTranscriptThread(thread: T3Thread): TranscriptTurn[] {
   return turns;
 }
 
-export function normalizeTranscript(snapshot: T3ThreadSnapshot, projectTitle = "Unknown project") {
+function normalizeSessionSettings(thread: T3ThreadShell): { interactionMode?: "default" | "plan"; modelSelection?: { instanceId: string; model: string; reasoningId?: string } } {
+  const bounded = (value: unknown, max: number): value is string => typeof value === "string" &&
+    value.length > 0 && value.length <= max && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+  const selection = thread.modelSelection;
+  const mode = thread.interactionMode === "default" || thread.interactionMode === "plan" ? thread.interactionMode : undefined;
+  if (!selection || !bounded(selection.instanceId, 128) || !bounded(selection.model, 256)) {
+    return mode === undefined ? {} : { interactionMode: mode };
+  }
+  const reasoning = Array.isArray(selection.options) && selection.options.length <= 64
+    ? selection.options.find((option) => option && ["reasoningEffort", "effort"].includes(option.id) && bounded(option.value, 128))?.value : undefined;
+  return { ...(mode === undefined ? {} : { interactionMode: mode }),
+    modelSelection: { instanceId: selection.instanceId, model: selection.model,
+      ...(typeof reasoning === "string" ? { reasoningId: reasoning } : {}) } };
+}
+
+export function normalizeTranscript(snapshot: T3ThreadSnapshot, projectTitle = "Unknown project", environment?: EnvironmentIdentity) {
   return {
+    ...environmentFields(environment),
     snapshotId: String(snapshot.snapshotSequence),
     session: {
+      ...environmentFields(environment),
       id: snapshot.thread.id,
       projectId: snapshot.thread.projectId,
       projectTitle,
@@ -642,10 +697,15 @@ export function normalizeTranscript(snapshot: T3ThreadSnapshot, projectTitle = "
       lastActivityAt: activityAt(snapshot.thread),
       settled: snapshot.thread.settledOverride === "settled",
       completedTurn: completedTurn(snapshot.thread),
+      hasPendingUserInput: snapshot.thread.hasPendingUserInput === true && snapshot.thread.latestTurn?.state === "running",
+      background: sessionBackground(snapshot.thread),
+      ...normalizeSessionSettings(snapshot.thread),
     },
+    tokenUsage: normalizeTokenUsage(snapshot.thread.activities),
     liveActivity: normalizeLiveActivity(snapshot.thread),
     liveActivities: normalizeLiveToolActivities(snapshot.thread),
     pendingPlanInput: normalizePendingPlanInput(snapshot.thread),
+    pendingProposedPlan: normalizePendingProposedPlan(snapshot.thread),
     turns: normalizeTranscriptThread(snapshot.thread),
   };
 }
