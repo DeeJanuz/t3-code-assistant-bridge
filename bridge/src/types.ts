@@ -131,6 +131,8 @@ export interface T3ThreadShell {
   readonly settledOverride: "settled" | "active" | null;
   readonly settledAt: string | null;
   readonly unsettledAt?: string | null;
+  /** T3 runs each subagent in a child thread; its sidebar nests these under the parent. */
+  readonly subagent?: boolean;
   readonly latestUserMessageAt?: string | null;
   readonly latestTurn: T3LatestTurn | null;
   readonly session: T3SessionState | null;

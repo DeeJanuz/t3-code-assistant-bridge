@@ -133,6 +133,10 @@ export function sessionBackground(thread: T3ThreadShell): SessionBackground | nu
   return null;
 }
 
+function waitingOnUser(thread: T3ThreadShell): boolean {
+  return thread.hasPendingUserInput === true && thread.latestTurn?.state === "running";
+}
+
 function sessionSummary(thread: T3ThreadShell, projects: ReadonlyMap<string, T3Project>, environment?: EnvironmentIdentity) {
   return {
     ...environmentFields(environment),
@@ -144,9 +148,21 @@ function sessionSummary(thread: T3ThreadShell, projects: ReadonlyMap<string, T3P
     lastActivityAt: activityAt(thread),
     settled: thread.settledOverride === "settled",
     completedTurn: completedTurn(thread),
-    hasPendingUserInput: thread.hasPendingUserInput === true && thread.latestTurn?.state === "running",
+    hasPendingUserInput: waitingOnUser(thread),
     background: sessionBackground(thread),
   };
+}
+
+/** T3's sidebar keeps this many of the newest settled threads; it pages older ones on demand. */
+export const RECENT_SETTLED_LIMIT = 25;
+
+/** The newest settled threads by settle time, ties at the cut included, as T3 keeps them. */
+function recentSettled(threads: readonly T3ThreadShell[]): T3ThreadShell[] {
+  const settledAt = (thread: T3ThreadShell) => validTime(thread.settledAt);
+  const times = threads.map(settledAt).filter((time): time is number => time !== null).sort((left, right) => right - left);
+  const cut = times[RECENT_SETTLED_LIMIT - 1] ?? -Infinity;
+  // A missing or unreadable settle time is never counted as older, matching T3.
+  return threads.filter((thread) => (settledAt(thread) ?? Infinity) >= cut);
 }
 
 export function normalizeSessions(snapshot: T3ShellSnapshot, config: BridgeConfig, environment?: EnvironmentIdentity) {
@@ -155,15 +171,16 @@ export function normalizeSessions(snapshot: T3ShellSnapshot, config: BridgeConfi
       .filter((project) => project.deletedAt == null && projectAllowed(project.id, config))
       .map((project) => [project.id, project] as const),
   );
+  // Subagent children never settle, so they would pile up. Show one only while it waits on the user.
   const visible = snapshot.threads.filter(
-    (thread) => thread.archivedAt === null && projects.has(thread.projectId),
+    (thread) => thread.archivedAt === null && projects.has(thread.projectId) &&
+      (thread.subagent !== true || waitingOnUser(thread)),
   );
   const unsettled = visible
     .filter((thread) => thread.settledOverride !== "settled")
     .sort(compareActivity)
     .map((thread) => sessionSummary(thread, projects, environment));
-  const settled = visible
-    .filter((thread) => thread.settledOverride === "settled")
+  const settled = recentSettled(visible.filter((thread) => thread.settledOverride === "settled"))
     .sort(compareActivity)
     .map((thread) => sessionSummary(thread, projects, environment));
   return {

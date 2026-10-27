@@ -104,6 +104,42 @@ describe("T3 V2 shell adapter", () => {
     assert.throws(() => requireIdleSession(shell.threads.find((thread) => thread.id === "running")!), { code: "session_busy" });
   });
 
+  it("leaves subagent children out of sessions unless one waits on the user", () => {
+    const child = (id: string, overrides: Record<string, unknown> = {}) => shellThread({ id,
+      lineage: { parentThreadId: "parent", relationshipToParent: "subagent", rootThreadId: "parent" }, ...overrides });
+    const shell = shellFromV2({ schemaVersion: 2, snapshotSequence: 5, projects: [project], archivedThreads: [], threads: [
+      shellThread({ id: "parent", lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: "parent" } }),
+      shellThread({ id: "fork", lineage: { parentThreadId: "parent", relationshipToParent: "fork", rootThreadId: "parent" } }),
+      child("finished", { latestRunId: RUN_1, status: "completed", latestRunRequestedAt: "2026-10-13T10:01:00.000Z",
+        latestRunCompletedAt: "2026-10-13T10:01:30.000Z" }),
+      child("asking", { latestRunId: RUN_1, status: "waiting", latestRunRequestedAt: "2026-10-13T10:01:00.000Z",
+        pendingRuntimeRequest: { id: "request-1", kind: "user_input", createdAt: "2026-10-13T10:01:05.000Z" } }),
+      // A question left over from a run that already ended is not waiting on anyone.
+      child("stale-question", { latestRunId: RUN_1, status: "interrupted", latestRunRequestedAt: "2026-10-13T10:01:00.000Z",
+        latestRunCompletedAt: "2026-10-13T10:01:30.000Z",
+        pendingRuntimeRequest: { id: "request-2", kind: "user_input", createdAt: "2026-10-13T10:01:05.000Z" } }),
+      child("settled-child", { settledOverride: "settled", settledAt: "2026-10-13T10:06:00.000Z" }),
+    ] });
+    const sessions = normalizeSessions(shell, config);
+    assert.deepEqual(sessions.unsettled.map((session) => session.id).sort(), ["asking", "fork", "parent"]);
+    assert.deepEqual(sessions.settled, []);
+  });
+
+  it("keeps the 25 newest settled sessions, as T3's sidebar does", () => {
+    const settledAt = (minute: number) => new Date(Date.UTC(2026, 9, 13, 10, minute)).toISOString();
+    const threads = Array.from({ length: 30 }, (_, i) => shellThread({ id: `settled-${i}`,
+      settledOverride: "settled", settledAt: settledAt(i) }));
+    // Ties at the cut stay, and a settled thread without a settle time is never treated as older.
+    threads.push(shellThread({ id: "tie", settledOverride: "settled", settledAt: settledAt(5) }),
+      shellThread({ id: "untimed", settledOverride: "settled", settledAt: null }));
+    const shell = shellFromV2({ schemaVersion: 2, snapshotSequence: 6, projects: [project], archivedThreads: [], threads });
+    const ids = new Set(normalizeSessions(shell, config).settled.map((session) => session.id));
+    assert.equal(ids.size, 27);
+    for (let i = 0; i < 30; i++) assert.equal(ids.has(`settled-${i}`), i >= 5, `settled-${i}`);
+    assert.ok(ids.has("tie"));
+    assert.ok(ids.has("untimed"));
+  });
+
   it("rejects structurally invalid shells", () => {
     assert.throws(() => shellFromV2({ snapshotSequence: 1, projects: [], threads: [{ id: "t" }] }), V2ShapeError);
     assert.throws(() => shellFromV2({ projects: [], threads: [] }), V2ShapeError);

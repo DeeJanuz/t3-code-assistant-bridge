@@ -173,6 +173,7 @@ export function shellThreadFromV2(value: unknown): T3ThreadShell {
   const base = baseThread(value);
   return {
     ...base,
+    ...(record(value.lineage) && value.lineage.relationshipToParent === "subagent" ? { subagent: true } : {}),
     latestUserMessageAt: nullableString(value.latestUserMessageAt),
     hasPendingUserInput: pending?.kind === "user_input",
     ...(background === undefined ? {} : { backgroundLiveness: background }),
